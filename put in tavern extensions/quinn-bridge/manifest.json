@@ -1,0 +1,12 @@
+{
+  "display_name": "Quinn Bridge",
+  "loading_order": 1,
+  "requires": [],
+  "optional": [],
+  "dependencies": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Local user",
+  "version": "0.1.0",
+  "auto_update": false
+}

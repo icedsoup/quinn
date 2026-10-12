@@ -1,0 +1,4 @@
+.quinn-bridge-panel { margin: 0.5em 0; }
+.quinn-bridge-buttons { display: flex; flex-wrap: wrap; gap: 0.4em; margin: 0.7em 0; }
+#quinn_bridge_status { display: block; margin-top: 0.5em; opacity: 0.9; }
+.quinn-bridge-note { opacity: 0.75; font-size: 0.9em; }
