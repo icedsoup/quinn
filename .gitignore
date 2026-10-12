@@ -15,3 +15,15 @@ venv/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local model/runtime assets
+models/
+backups/
+koboldcpp.exe
+sillytavern.bat.lnk
+SillyTavern/
+config.kcpps
+
+# Local bridge state and credentials
+QuinnBridge/bridge/bridge_token.txt
+QuinnBridge/bridge/quinn_bridge.sqlite3
