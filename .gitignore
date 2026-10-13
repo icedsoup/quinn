@@ -27,3 +27,6 @@ config.kcpps
 # Local bridge state and credentials
 QuinnBridge/bridge/bridge_token.txt
 QuinnBridge/bridge/quinn_bridge.sqlite3
+
+# Quinn config
+quinn_config.json

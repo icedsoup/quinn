@@ -1,0 +1,36 @@
+{
+  "_comment": "Copy this file to quinn_config.json and fill in your values. quinn_config.json is gitignored.",
+
+  "discord_token": "",
+  "_token_note": "Your Discord user token (the same one in config.json works). Never commit this.",
+
+  "bridge_url":   "http://127.0.0.1:8765",
+  "bridge_token": "",
+  "_bridge_note": "Leave blank — quinn_discord.py reads QuinnBridge/bridge/bridge_token.txt automatically.",
+
+  "sillytavern_start": "SillyTavern\\start.bat",
+  "_tavern_note": "Path to SillyTavern's start script, relative to the repo root. Adjust if yours differs.",
+
+  "allowed_guild_ids":   [],
+  "allowed_channel_ids": [],
+  "_channels_note": "IDs of guilds/channels Quinn watches. Empty = all (only safe in a private server).",
+
+  "respond_to_dms":      true,
+  "respond_to_mentions": true,
+  "_respond_note": "respond_to_mentions: reply when @-mentioned in any watched guild.",
+
+  "reply_timeout_seconds": 120,
+  "_timeout_note": "How long to wait for SillyTavern to finish generating before giving up.",
+
+  "typing_simulation":   true,
+  "typing_rate_per_char": 0.040,
+  "typing_min_seconds":   1.2,
+  "typing_max_seconds":   9.0,
+  "_typing_note": "Realistic typing delay after generation finishes. Rate is seconds per character.",
+
+  "dry_run": false,
+  "_dry_run_note": "true = Quinn reads and logs messages but never sends replies. Good for testing.",
+
+  "log_level": "INFO",
+  "_log_note": "DEBUG shows every poll cycle. INFO is normal. WARNING is quiet."
+}
