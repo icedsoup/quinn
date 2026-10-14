@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -45,6 +44,7 @@ def init_db():
                 job_id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
                 display_name TEXT NOT NULL,
+                avatar_url TEXT NOT NULL DEFAULT '',
                 message TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'queued',
                 reply TEXT,
@@ -62,9 +62,10 @@ def init_db():
         }
 
         if "processing_at" not in columns:
-            con.execute(
-                "ALTER TABLE jobs ADD COLUMN processing_at REAL"
-            )
+            con.execute("ALTER TABLE jobs ADD COLUMN processing_at REAL")
+
+        if "avatar_url" not in columns:
+            con.execute("ALTER TABLE jobs ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''")
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS turns (
@@ -296,11 +297,12 @@ class Handler(BaseHTTPRequestHandler):
             history = history[-20:]
 
             self.send_json(200, {
-                "job_id": row["job_id"],
-                "user_id": row["user_id"],
+                "job_id"      : row["job_id"],
+                "user_id"     : row["user_id"],
                 "display_name": row["display_name"],
-                "message": row["message"],
-                "history": history,
+                "avatar_url"  : row["avatar_url"] or "",
+                "message"     : row["message"],
+                "history"     : history,
             })
             return
 
@@ -349,6 +351,7 @@ class Handler(BaseHTTPRequestHandler):
                 str(data.get("display_name", "Contact")).strip()[:100]
                 or "Contact"
             )
+            avatar_url = str(data.get("avatar_url", "")).strip()[:512]
             message = str(data.get("message", "")).strip()
 
             if not user_id or len(user_id) > 128:
@@ -379,12 +382,12 @@ class Handler(BaseHTTPRequestHandler):
                 con.execute(
                     """
                     INSERT INTO jobs(
-                        job_id, user_id, display_name, message,
+                        job_id, user_id, display_name, avatar_url, message,
                         status, created_at
                     )
-                    VALUES (?, ?, ?, ?, 'queued', ?)
+                    VALUES (?, ?, ?, ?, ?, 'queued', ?)
                     """,
-                    (job_id, user_id, display_name, message, now),
+                    (job_id, user_id, display_name, avatar_url, message, now),
                 )
 
                 con.execute(

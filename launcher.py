@@ -153,9 +153,27 @@ def _http_ok(url: str, timeout: float = 2.0) -> bool:
     except Exception:
         return False
 
-def bridge_healthy()      -> bool: return _http_ok("http://127.0.0.1:8765/health")
-def sillytavern_healthy() -> bool: return _http_ok("http://127.0.0.1:8000/", timeout=1.5)
-def kobold_healthy()      -> bool: return _http_ok("http://127.0.0.1:5001/api/v1/info", timeout=1.5)
+def bridge_healthy() -> bool:
+    return _http_ok("http://127.0.0.1:8765/health")
+
+def sillytavern_healthy() -> bool:
+    # ST serves HTML — any 200 or 3xx counts.  Try the root and the API.
+    for url in ("http://127.0.0.1:8000/", "http://127.0.0.1:8001/"):
+        if _http_ok(url, timeout=2.0):
+            return True
+    return False
+
+def kobold_healthy() -> bool:
+    # Different KoboldCpp versions expose different endpoints.
+    # Try them all; as long as one returns 2xx the process is up.
+    for url in (
+        "http://127.0.0.1:5001/api/v1/info",       # current stable
+        "http://127.0.0.1:5001/api/extra/version",  # some builds
+        "http://127.0.0.1:5001/",                   # root always works
+    ):
+        if _http_ok(url, timeout=2.5):
+            return True
+    return False
 
 # ─── config helpers ───────────────────────────────────────────────────────────
 
@@ -185,10 +203,31 @@ def _tavern_start_cmd() -> Optional[list[str]]:
             return ["cmd", "/c", str(p)]
         return [str(p)]
 
-    for candidate in ("SillyTavern/start.bat", "SillyTavern/Start SillyTavern.bat"):
+    # Common relative paths from the repo root
+    rel_candidates = (
+        "SillyTavern/start.bat",
+        "SillyTavern/Start SillyTavern.bat",
+        "../SillyTavern/start.bat",
+        "../SillyTavern/Start SillyTavern.bat",
+    )
+    for candidate in rel_candidates:
         p = ROOT / candidate
         if p.exists():
             return ["cmd", "/c", str(p)]
+
+    # Common absolute Windows paths
+    home = Path.home()
+    abs_candidates = (
+        home / "SillyTavern" / "start.bat",
+        home / "SillyTavern" / "Start SillyTavern.bat",
+        Path("C:/SillyTavern/start.bat"),
+        Path("C:/SillyTavern/Start SillyTavern.bat"),
+        Path("D:/SillyTavern/start.bat"),
+    )
+    for p in abs_candidates:
+        if p.exists():
+            return ["cmd", "/c", str(p)]
+
     return None
 
 def _bridge_token_str() -> Optional[str]:
@@ -322,9 +361,11 @@ def do_tavern() -> bool:
         return False
     cmd = _tavern_start_cmd()
     if cmd is None:
-        print(err_("\n  SillyTavern start command not found."))
-        print(dim("  Add sillytavern_start to quinn_config.json:"))
-        print(dim('  "sillytavern_start": "SillyTavern\\\\start.bat"'))
+        print(err_("\n  SillyTavern start script not found."))
+        print(dim("  Add the exact path to quinn_config.json:"))
+        print(dim('  "sillytavern_start": "C:\\\\SillyTavern\\\\start.bat"'))
+        print(dim("  (replace with the actual path to your SillyTavern folder)"))
+        print(dim("  You can still launch SillyTavern manually — just open that .bat file."))
         return False
     ok = COMPS["tavern"].start_cmd(cmd)
     if ok:

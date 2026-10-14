@@ -139,14 +139,25 @@ class Bridge:
         except Exception:
             return False
 
-    async def enqueue(self, user_id: str, display_name: str, message: str) -> str | None:
+    async def enqueue(
+        self,
+        user_id: str,
+        display_name: str,
+        message: str,
+        avatar_url: str = "",
+    ) -> str | None:
         """
         POST /v1/messages.
         Returns job_id on success, None on failure.
-        The bridge tags the job with user_id so it can attach the right
-        per-user conversation history when SillyTavern claims it.
+        avatar_url is the Discord CDN URL for the user's profile picture —
+        the SillyTavern extension uses it when creating per-user personas.
         """
-        body = {"user_id": user_id, "display_name": display_name, "message": message}
+        body = {
+            "user_id"     : user_id,
+            "display_name": display_name,
+            "message"     : message,
+            "avatar_url"  : avatar_url,
+        }
         try:
             async with (await self._session()).post(
                 f"{self._base}/v1/messages",
@@ -292,9 +303,10 @@ class QuinnClient(discord.Client):
 
     async def _handle(self, m: discord.Message):
         # Grab identifying info before any awaits
-        uid   = str(m.author.id)
-        name  = m.author.display_name
-        text  = m.content.strip()
+        uid    = str(m.author.id)
+        name   = m.author.display_name
+        text   = m.content.strip()
+        avatar = str(m.author.avatar.url) if m.author.avatar else ""
         if not text:
             return
 
@@ -305,7 +317,7 @@ class QuinnClient(discord.Client):
             return
 
         # ── enqueue to bridge ──
-        job_id = await self.bridge.enqueue(uid, name, text)
+        job_id = await self.bridge.enqueue(uid, name, text, avatar_url=avatar)
         if not job_id:
             log.warning("Enqueue failed for %s — bridge down?", name)
             return
@@ -328,8 +340,14 @@ class QuinnClient(discord.Client):
             try:
                 await m.reply(reply, mention_author=False)
                 log.info("→ [%s] %s (job %s, %d chars)", uid, name, job_id, len(reply))
+            except discord.Forbidden:
+                log.warning(
+                    "No permission to reply in channel %s (%s) — "
+                    "Quinn lacks Send Messages / Read Message History.",
+                    m.channel.id, getattr(m.channel, "name", "DM"),
+                )
             except discord.HTTPException as exc:
-                log.error("Discord send error: %s", exc)
+                log.error("Discord send error (HTTP %s): %s", exc.status, exc)
         else:
             log.warning("No reply for job %s (timeout or bridge failure)", job_id)
 
