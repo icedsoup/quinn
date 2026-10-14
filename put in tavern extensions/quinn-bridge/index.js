@@ -139,17 +139,35 @@ async function bridgeFetch(path, opts = {}) {
 // Older ST uses /savechat and /getchat.  We try both.
 
 function stHeaders() {
-    // ST may require a CSRF token; getRequestHeaders is available globally in ST.
+    // ST 1.12+ requires a CSRF token on POST requests (double-submit cookie
+    // pattern via csrf-csrf).  getRequestHeaders() from ST's own script.js
+    // returns the right token — but it only works if credentials (cookies)
+    // are also sent.  We add a cookie fallback for robustness.
     if (typeof window.getRequestHeaders === "function") {
         return window.getRequestHeaders();
     }
-    return { "Content-Type": "application/json" };
+    // Fallback: read token from cookie.  csrf-csrf uses 'csrf-token' by
+    // default; some ST builds use 'XSRF-TOKEN' or '_csrf'.
+    const m = document.cookie.match(
+        /(?:^|;\s*)(?:csrf-token|XSRF-TOKEN|_csrf)=([^;]*)/
+    );
+    const headers = { "Content-Type": "application/json" };
+    if (m) {
+        const tok = decodeURIComponent(m[1]);
+        headers["X-CSRF-Token"]  = tok;   // csrf-csrf / standard
+        headers["X-XSRF-Token"]  = tok;   // alternate casing
+    }
+    return headers;
 }
 
 async function stPost(path, body) {
+    // credentials:'same-origin' is REQUIRED for the double-submit CSRF check:
+    // ST validates that the token in the header matches the token in the cookie,
+    // and cookies are only sent when credentials is set.
     const r = await fetch(path, {
         method: "POST",
         headers: stHeaders(),
+        credentials: "same-origin",
         body: JSON.stringify(body),
     });
     return r; // caller checks .ok

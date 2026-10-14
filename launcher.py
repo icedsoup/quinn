@@ -1,26 +1,28 @@
 """
 launcher.py — Project Quinn mission control.
 
-A terminal launcher that starts/stops each component in its own console
-window so their outputs never tangle.  KoboldCpp is intentionally excluded
-(you launch it manually as always).
+A terminal launcher that starts/stops each component.  Bridge and Quinn
+Discord run in this same terminal window (their output is piped in with
+color-coded prefixes so you can watch everything in one place).  SillyTavern
+and the Sniper each open their own window because they have their own UIs.
 
 Managed components:
-  [S] Karuta Sniper     main.py
-  [Q] Quinn Discord     quinn_discord.py          (also starts bridge)
-  [B] Bridge Server     QuinnBridge/bridge/server.py
-  [T] SillyTavern       configurable via quinn_config.json → sillytavern_start
+  [S] Karuta Sniper     main.py                        → own window
+  [Q] Quinn Discord     quinn_discord.py               → this terminal
+  [B] Bridge Server     QuinnBridge/bridge/server.py   → this terminal
+  [T] SillyTavern       configurable via quinn_config.json → own window
 
 Launch combos:
   [1]  Sniper only
-  [2]  Quinn only   →  bridge + Quinn Discord
-  [3]  Both         →  bridge + Quinn Discord + Sniper
+  [2]  Quinn setup  →  bridge + SillyTavern + Quinn Discord
+  [3]  Everything   →  bridge + SillyTavern + Quinn Discord + Sniper
 
 Bridge token note:
   After the bridge starts for the first time it writes bridge_token.txt.
   The launcher shows that token so you can paste it into SillyTavern's
   Quinn Bridge extension panel (Settings → Extensions → Quinn Bridge).
-  You only need to do this once; SillyTavern stores it in sessionStorage.
+  You only need to do this once — SillyTavern stores it in localStorage
+  and auto-starts polling on every future load.
 
 Usage:
   python launcher.py
@@ -34,12 +36,14 @@ import platform
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from colorama import Back, Fore, Style, init as colorama_init
 
@@ -47,15 +51,14 @@ colorama_init(autoreset=True)
 
 # ─── constants ────────────────────────────────────────────────────────────────
 
-ROOT      = Path(__file__).parent
-IS_WIN    = platform.system() == "Windows"
-QUINN_CFG = ROOT / "quinn_config.json"
-BRIDGE_TOK= ROOT / "QuinnBridge" / "bridge" / "bridge_token.txt"
+ROOT       = Path(__file__).parent
+IS_WIN     = platform.system() == "Windows"
+QUINN_CFG  = ROOT / "quinn_config.json"
+BRIDGE_TOK = ROOT / "QuinnBridge" / "bridge" / "bridge_token.txt"
 
-VERSION   = "1.0"
+VERSION    = "1.1"
 
 # ─── color helpers ────────────────────────────────────────────────────────────
-# Single place to change the palette — every UI element routes through these.
 
 def _c(text: str, *codes: str) -> str:
     return "".join(codes) + text + Style.RESET_ALL
@@ -67,81 +70,177 @@ ok_    = lambda t: _c(t, Fore.GREEN)
 warn_  = lambda t: _c(t, Fore.YELLOW)
 err_   = lambda t: _c(t, Fore.RED)
 key    = lambda t: _c(t, Fore.YELLOW + Style.BRIGHT)
+pfx_b  = lambda t: _c(t, Fore.BLUE   + Style.BRIGHT)   # bridge prefix
+pfx_q  = lambda t: _c(t, Fore.MAGENTA + Style.BRIGHT)  # quinn prefix
 
 def pill(text: str, on: bool) -> str:
-    """Colored status pill."""
     return _c(f" {text} ", Fore.BLACK + (Back.GREEN if on else Back.RED))
+
+# ─── live log buffer (bridge + quinn pipe here) ───────────────────────────────
+# A ring-buffer of the last 20 lines from piped subprocesses.
+# Background reader threads append; draw() reads under the lock.
+
+_LOG: deque[str] = deque(maxlen=20)
+_LOG_LOCK        = threading.Lock()
+
+# Suppress bridge's constant /v1/next polling spam — 1 poll/sec is noise.
+_BRIDGE_POLL_NOISE = "/v1/next"
+
+
+def _log_push(line: str) -> None:
+    with _LOG_LOCK:
+        _LOG.append(line)
+
+
+def _pipe_reader(proc: subprocess.Popen, label: str, color_fn) -> None:
+    """
+    Daemon thread: reads piped subprocess output line-by-line and pushes
+    formatted lines into _LOG.  Exits cleanly when the process ends.
+    """
+    try:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if not line:
+                continue
+            # Suppress bridge polling noise so the log stays readable
+            if label == "[bridge]" and _BRIDGE_POLL_NOISE in line:
+                continue
+            ts = time.strftime("%H:%M:%S")
+            _log_push(f"  {dim(ts)} {color_fn(label):<20} {line}")
+    except Exception:
+        pass
+
 
 # ─── component model ──────────────────────────────────────────────────────────
 
 @dataclass
 class Component:
     """
-    One managed process.  open_window=True gives it a separate console so
-    KarutaConsole / Quinn logs / bridge logs don't collide with this UI.
+    One managed process.
+
+    open_window=True  → launches in its own console (SillyTavern, Sniper)
+    open_window=False → runs windowless with stdout piped into the log buffer
+                        (Bridge, Quinn Discord)
+
+    health_check      → optional callable that returns True when the service
+                        is reachable.  Used for processes (like ST) whose
+                        launcher wrapper exits immediately but whose service
+                        stays up.
     """
-    label      : str
-    _proc      : Optional[subprocess.Popen] = field(default=None, init=False, repr=False)
-    open_window: bool = True
+    label       : str
+    log_prefix  : str                      = ""
+    log_color   : Callable                 = staticmethod(accent)
+    open_window : bool                     = False
+    health_check: Optional[Callable[[], bool]] = None
+
+    _proc  : Optional[subprocess.Popen]   = field(default=None, init=False, repr=False)
+    _reader: Optional[threading.Thread]   = field(default=None, init=False, repr=False)
 
     @property
     def alive(self) -> bool:
+        # If we have a health check, prefer it (e.g. ST's node server stays
+        # running after the cmd.exe launcher process exits).
+        if self.health_check is not None:
+            return self.health_check()
         return self._proc is not None and self._proc.poll() is None
 
     # ── spawn ──
 
     def start_python(self, script: Path, *args: str) -> bool:
-        """Launch a Python script, returns True if Popen succeeded."""
-        return self._spawn([sys.executable, str(script)] + list(args))
+        # -u = unbuffered stdout/stderr so piped output appears immediately
+        return self._spawn([sys.executable, "-u", str(script)] + list(args))
 
     def start_cmd(self, cmd: list[str], cwd: Optional[Path] = None) -> bool:
-        """Launch an arbitrary command (e.g. a .bat file)."""
         return self._spawn(cmd, cwd=cwd)
 
     def _spawn(self, cmd: list[str], cwd: Optional[Path] = None) -> bool:
-        if self.alive:
-            return True
+        if self._proc is not None and self._proc.poll() is None:
+            return True   # already running
+
         kwargs: dict = {"cwd": str(cwd or ROOT)}
+
         if self.open_window:
+            # Own console window (Sniper, SillyTavern)
             if IS_WIN:
                 kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
             else:
                 kwargs["start_new_session"] = True
                 kwargs["stdout"] = subprocess.DEVNULL
                 kwargs["stderr"] = subprocess.DEVNULL
+        else:
+            # Pipe into launcher terminal
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.STDOUT
+            if IS_WIN:
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
         try:
             self._proc = subprocess.Popen(cmd, **kwargs)
-            return True
         except Exception as exc:
             print(err_(f"\n  Could not start {self.label}: {exc}"))
             return False
 
+        # Start the reader thread for piped processes
+        if not self.open_window and self._reader is None:
+            self._reader = threading.Thread(
+                target=_pipe_reader,
+                args=(self._proc, self.log_prefix, self.log_color),
+                daemon=True,
+                name=f"reader-{self.label}",
+            )
+            self._reader.start()
+
+        return True
+
     # ── stop ──
 
-    def stop(self):
+    def stop(self) -> None:
         if self._proc and self._proc.poll() is None:
             try:
                 self._proc.terminate()
                 self._proc.wait(timeout=6)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
-        self._proc = None
+        self._proc   = None
+        self._reader = None
 
     # ── display ──
 
     def status_line(self) -> str:
-        dot    = ok_("●") if self.alive else dim("○")
-        state  = pill("RUNNING", True) if self.alive else dim("stopped")
+        up    = self.alive
+        dot   = ok_("●") if up else dim("○")
+        state = pill("RUNNING", True) if up else dim("stopped")
         return f"  {dot}  {self.label:<26} {state}"
 
 
 # ─── registry ─────────────────────────────────────────────────────────────────
 
 COMPS: dict[str, Component] = {
-    "sniper":  Component("Karuta Sniper"),
-    "bridge":  Component("Bridge Server", open_window=True),
-    "quinn":   Component("Quinn Discord"),
-    "tavern":  Component("SillyTavern"),
+    "sniper": Component(
+        "Karuta Sniper",
+        log_prefix="[sniper]",
+        log_color=warn_,
+        open_window=True,
+    ),
+    "bridge": Component(
+        "Bridge Server",
+        log_prefix="[bridge]",
+        log_color=pfx_b,
+        open_window=False,   # pipes into launcher terminal
+    ),
+    "quinn": Component(
+        "Quinn Discord",
+        log_prefix="[quinn]",
+        log_color=pfx_q,
+        open_window=False,   # pipes into launcher terminal
+    ),
+    "tavern": Component(
+        "SillyTavern",
+        log_prefix="[tavern]",
+        log_color=ok_,
+        open_window=True,    # needs its own window (opens a browser)
+        health_check=None,   # set after sillytavern_healthy is defined below
+    ),
 }
 
 # ─── health checks ────────────────────────────────────────────────────────────
@@ -153,27 +252,32 @@ def _http_ok(url: str, timeout: float = 2.0) -> bool:
     except Exception:
         return False
 
+
 def bridge_healthy() -> bool:
     return _http_ok("http://127.0.0.1:8765/health")
 
+
 def sillytavern_healthy() -> bool:
-    # ST serves HTML — any 200 or 3xx counts.  Try the root and the API.
     for url in ("http://127.0.0.1:8000/", "http://127.0.0.1:8001/"):
         if _http_ok(url, timeout=2.0):
             return True
     return False
 
+
 def kobold_healthy() -> bool:
-    # Different KoboldCpp versions expose different endpoints.
-    # Try them all; as long as one returns 2xx the process is up.
+    # Different KoboldCpp versions expose different endpoints — try them all.
     for url in (
-        "http://127.0.0.1:5001/api/v1/info",       # current stable
-        "http://127.0.0.1:5001/api/extra/version",  # some builds
-        "http://127.0.0.1:5001/",                   # root always works
+        "http://127.0.0.1:5001/api/v1/info",
+        "http://127.0.0.1:5001/api/extra/version",
+        "http://127.0.0.1:5001/",
     ):
         if _http_ok(url, timeout=2.5):
             return True
     return False
+
+
+# Wire up ST health check now that the function is defined
+COMPS["tavern"].health_check = sillytavern_healthy
 
 # ─── config helpers ───────────────────────────────────────────────────────────
 
@@ -183,13 +287,14 @@ def _read_quinn_cfg() -> dict:
             return json.load(fh)
     return {}
 
+
 def _tavern_start_cmd() -> Optional[list[str]]:
     """
     Find a SillyTavern start command.
     Priority:
-      1. quinn_config.json → "sillytavern_start"   (path string or cmd list)
-      2. SillyTavern/start.bat                       (default install location)
-      3. SillyTavern/Start SillyTavern.bat
+      1. quinn_config.json → "sillytavern_start"  (path string or cmd list)
+      2. Relative paths from repo root
+      3. Common absolute Windows paths
     """
     cfg = _read_quinn_cfg()
     explicit = cfg.get("sillytavern_start")
@@ -203,7 +308,6 @@ def _tavern_start_cmd() -> Optional[list[str]]:
             return ["cmd", "/c", str(p)]
         return [str(p)]
 
-    # Common relative paths from the repo root
     rel_candidates = (
         "SillyTavern/start.bat",
         "SillyTavern/Start SillyTavern.bat",
@@ -215,7 +319,6 @@ def _tavern_start_cmd() -> Optional[list[str]]:
         if p.exists():
             return ["cmd", "/c", str(p)]
 
-    # Common absolute Windows paths
     home = Path.home()
     abs_candidates = (
         home / "SillyTavern" / "start.bat",
@@ -223,6 +326,7 @@ def _tavern_start_cmd() -> Optional[list[str]]:
         Path("C:/SillyTavern/start.bat"),
         Path("C:/SillyTavern/Start SillyTavern.bat"),
         Path("D:/SillyTavern/start.bat"),
+        Path("D:/SillyTavern/Start SillyTavern.bat"),
     )
     for p in abs_candidates:
         if p.exists():
@@ -230,10 +334,12 @@ def _tavern_start_cmd() -> Optional[list[str]]:
 
     return None
 
+
 def _bridge_token_str() -> Optional[str]:
     if BRIDGE_TOK.exists():
         return BRIDGE_TOK.read_text(encoding="utf-8").strip()
     return None
+
 
 def _wait_bridge_token(max_wait: float = 8.0) -> bool:
     deadline = time.monotonic() + max_wait
@@ -242,6 +348,32 @@ def _wait_bridge_token(max_wait: float = 8.0) -> bool:
             return True
         time.sleep(0.35)
     return False
+
+
+def _kill_st_port() -> None:
+    """
+    Best-effort: kill whatever process is listening on ST's port (8000/8001).
+    ST's start.bat launches node, which becomes orphaned when cmd.exe exits,
+    so we can't kill it through the Popen handle.
+    """
+    if not IS_WIN:
+        return
+    for port in (8000, 8001):
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and f":{port}" in parts[1] and parts[3] == "LISTENING":
+                    pid = parts[4]
+                    subprocess.run(
+                        ["taskkill", "/PID", pid, "/F"],
+                        capture_output=True, timeout=5,
+                    )
+        except Exception:
+            pass
 
 # ─── draw ─────────────────────────────────────────────────────────────────────
 
@@ -271,10 +403,9 @@ def draw(state: dict):
 
     # ── external ──
     print(dim("  ── EXTERNAL (you start these) ───────────────────────"))
-    ext = [("KoboldCpp", kobold_healthy())]
-    for name, alive in ext:
-        dot   = ok_("●") if alive else dim("○")
-        state_= ok_("reachable") if alive else dim("not detected")
+    for name, alive in [("KoboldCpp", kobold_healthy())]:
+        dot    = ok_("●") if alive else dim("○")
+        state_ = ok_("reachable") if alive else dim("not detected")
         print(f"  {dot}  {name:<26} {state_}")
     print()
 
@@ -290,22 +421,36 @@ def draw(state: dict):
         print()
         print(dim("  ── BRIDGE TOKEN (paste into SillyTavern extension) ──"))
         print(f"  {accent(tok)}")
-        print(dim("  SillyTavern → Extensions → Quinn Bridge → paste → Test"))
+        print(dim("  SillyTavern → Extensions → Quinn Bridge → paste → Save"))
+        print(dim("  (one-time setup — token persists in localStorage after that)"))
 
+    # ── controls ──
     print()
     print(dim("  ── LAUNCH ───────────────────────────────────────────"))
     print(f"  {key('[1]')}  Sniper only")
-    print(f"  {key('[2]')}  Quinn only     (bridge + Quinn Discord)")
-    print(f"  {key('[3]')}  Both           (bridge + Quinn + Sniper)")
-    print(f"  {key('[t]')}  SillyTavern    (standalone)")
+    print(f"  {key('[2]')}  Quinn setup   (bridge + ST + Quinn Discord)")
+    print(f"  {key('[3]')}  Everything    (bridge + ST + Quinn + Sniper)")
+    print(f"  {key('[t]')}  SillyTavern   (standalone)")
     print()
     print(dim("  ── CONTROLS ─────────────────────────────────────────"))
     print(f"  {key('[s]')}  Stop all managed components")
     print(f"  {key('[d]')}  Toggle dry-run  (Quinn is {'DRY' if dry else 'LIVE'})")
-    print(f"  {key('[r]')}  Refresh")
+    print(f"  {key('[r]')}  Refresh status")
     print(f"  {key('[q]')}  Quit launcher   (components keep running)")
     print()
+
+    # ── live log (bridge + quinn pipe here) ──
+    with _LOG_LOCK:
+        lines = list(_LOG)
+
+    if lines:
+        print(dim("  ── LOG ──────────────────────────────────────────────"))
+        for line in lines:
+            print(line)
+        print()
+
     print(accent("  ▶ "), end="", flush=True)
+
 
 # ─── launch actions ───────────────────────────────────────────────────────────
 
@@ -320,22 +465,54 @@ def do_sniper() -> bool:
 
 
 def do_bridge() -> bool:
-    """Start bridge server; waits for the token file to appear."""
+    """Start bridge server; wait for its token file before returning."""
+    if bridge_healthy():
+        return True   # already up (maybe from a previous session)
     if COMPS["bridge"].alive:
         return True
     ok = COMPS["bridge"].start_python(ROOT / "QuinnBridge" / "bridge" / "server.py")
     if not ok:
         return False
-    print(ok_("\n  ✓ Bridge server launched."), end="")
-    print(dim("  Waiting for token…"), end="", flush=True)
+    print(ok_("\n  ✓ Bridge launched."), end="  ")
+    print(dim("Waiting for token…"), end="", flush=True)
     if _wait_bridge_token():
         tok = _bridge_token_str()
         print(ok_(" ready"))
         print(f"  Bridge token: {accent(tok)}")
-        print(dim("  → Paste into SillyTavern extension settings if not already done."))
+        print(dim("  → Paste into SillyTavern extension if not already done."))
     else:
         print(warn_(" timed out — bridge may not have written its token yet"))
     return True
+
+
+def do_tavern() -> bool:
+    if sillytavern_healthy():
+        _log_push(f"  {dim(time.strftime('%H:%M:%S'))} {ok_('[tavern]'):<20} Already running — skipping launch.")
+        return True
+    if COMPS["tavern"].alive:
+        print(warn_("\n  SillyTavern already launched."))
+        return True
+    cmd = _tavern_start_cmd()
+    if cmd is None:
+        print(err_("\n  SillyTavern start script not found."))
+        print(dim("  Add the exact path to quinn_config.json:"))
+        print(dim('  "sillytavern_start": "C:\\\\SillyTavern\\\\start.bat"'))
+        print(dim("  You can still launch it manually."))
+        return False
+    ok = COMPS["tavern"].start_cmd(cmd)
+    if ok:
+        print(ok_("\n  ✓ SillyTavern launched in new window."))
+        print(dim("  (Waiting for ST to become reachable…)"), end="", flush=True)
+        # Give ST ~20 s to start before we continue
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if sillytavern_healthy():
+                print(ok_(" up!"))
+                break
+            time.sleep(0.8)
+        else:
+            print(warn_(" still not reachable — continuing anyway"))
+    return ok
 
 
 def do_quinn(dry_run: bool) -> bool:
@@ -351,32 +528,17 @@ def do_quinn(dry_run: bool) -> bool:
     args = ("--dry-run",) if dry_run else ()
     ok = COMPS["quinn"].start_python(ROOT / "quinn_discord.py", *args)
     if ok:
-        print(ok_("  ✓ Quinn Discord launched in new window."))
-    return ok
-
-
-def do_tavern() -> bool:
-    if COMPS["tavern"].alive:
-        print(warn_("\n  SillyTavern already running."))
-        return False
-    cmd = _tavern_start_cmd()
-    if cmd is None:
-        print(err_("\n  SillyTavern start script not found."))
-        print(dim("  Add the exact path to quinn_config.json:"))
-        print(dim('  "sillytavern_start": "C:\\\\SillyTavern\\\\start.bat"'))
-        print(dim("  (replace with the actual path to your SillyTavern folder)"))
-        print(dim("  You can still launch SillyTavern manually — just open that .bat file."))
-        return False
-    ok = COMPS["tavern"].start_cmd(cmd)
-    if ok:
-        print(ok_("\n  ✓ SillyTavern launched in new window."))
+        print(ok_("  ✓ Quinn Discord launched (output appears in log below)."))
     return ok
 
 
 def do_stop_all():
     for comp in COMPS.values():
         comp.stop()
+    # ST's node process may outlive the cmd.exe launcher — try to kill by port
+    _kill_st_port()
     print(err_("\n  All managed components stopped."))
+
 
 # ─── main loop ────────────────────────────────────────────────────────────────
 
@@ -386,7 +548,7 @@ def main():
         signal.signal(signal.SIGBREAK, lambda *_: None)
 
     state    = {"dry_run": False}
-    pause_ms = 0.0   # seconds to pause before redraw (let output settle)
+    pause_ms = 0.0
 
     while True:
         if pause_ms:
@@ -406,12 +568,17 @@ def main():
                 do_sniper()
                 pause_ms = 1.2
             case "2":
-                do_quinn(state["dry_run"])
+                # Bridge → ST → Quinn (ST needs to be up before Quinn polls it)
+                if do_bridge():
+                    do_tavern()
+                    do_quinn(state["dry_run"])
                 pause_ms = 1.5
             case "3":
-                do_sniper()
+                if do_bridge():
+                    do_tavern()
+                    do_quinn(state["dry_run"])
                 time.sleep(0.3)
-                do_quinn(state["dry_run"])
+                do_sniper()
                 pause_ms = 1.5
             case "t":
                 do_tavern()
@@ -422,10 +589,10 @@ def main():
             case "d":
                 state["dry_run"] = not state["dry_run"]
             case "q":
-                print(accent("\n  Launcher closed.  Components keep running in their windows.\n"))
+                print(accent("\n  Launcher closed.  Components keep running.\n"))
                 sys.exit(0)
             case _:
-                pass   # unknown → silent redraw
+                pass   # unknown input → silent redraw
 
 
 if __name__ == "__main__":

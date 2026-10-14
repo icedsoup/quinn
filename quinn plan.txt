@@ -1,0 +1,19 @@
+discord behavior:
+don't reply to dms, just message back in the dm. only reply to mentions.
+give time to read the message like a human before starting the discord typing status
+configurable and adaptive reply delay
+inbox feature
+can instigate / message first
+can send multiple messages back to back
+can send, understand gifs, emojis, and stickers
+
+ai responses:
+less / no roleplaying
+fix stupidity
+less old timey language
+upgrade model
+import my discord message data
+understand slang
+fix memory
+fix temper
+fine tune prompt

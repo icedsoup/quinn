@@ -164,7 +164,7 @@ class Bridge:
                 json=body,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
-                if r.status == 200:
+                if r.status in (200, 202):   # bridge returns 202 Accepted
                     return (await r.json()).get("job_id")
                 log.warning("Bridge enqueue → HTTP %s", r.status)
         except Exception as exc:
