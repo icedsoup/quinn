@@ -83,8 +83,9 @@ def pill(text: str, on: bool) -> str:
 _LOG: deque[str] = deque(maxlen=20)
 _LOG_LOCK        = threading.Lock()
 
-# Suppress bridge's constant /v1/next polling spam — 1 poll/sec is noise.
-_BRIDGE_POLL_NOISE = "/v1/next"
+# Suppress bridge noise: /v1/next polling (1/sec) and CORS preflight chatter.
+# server.py emits both, neither carries useful info in normal operation.
+_BRIDGE_NOISE = frozenset({"/v1/next", "CORS preflight"})
 
 
 def _log_push(line: str) -> None:
@@ -102,11 +103,14 @@ def _pipe_reader(proc: subprocess.Popen, label: str, color_fn) -> None:
             line = raw.decode("utf-8", errors="replace").rstrip()
             if not line:
                 continue
-            # Suppress bridge polling noise so the log stays readable
-            if label == "[bridge]" and _BRIDGE_POLL_NOISE in line:
+            # Suppress bridge noise (polling + CORS preflight) — not useful day-to-day
+            if label == "[bridge]" and any(n in line for n in _BRIDGE_NOISE):
                 continue
             ts = time.strftime("%H:%M:%S")
-            _log_push(f"  {dim(ts)} {color_fn(label):<20} {line}")
+            # server.py prints its own "[bridge] ..." prefix — strip it before we
+            # add the colour-coded one, otherwise the log reads "[bridge] [bridge] ..."
+            display = line[len(label):].lstrip() if line.startswith(label) else line
+            _log_push(f"  {dim(ts)} {color_fn(label):<20} {display}")
     except Exception:
         pass
 
@@ -590,6 +594,13 @@ def main():
                 state["dry_run"] = not state["dry_run"]
             case "q":
                 print(accent("\n  Launcher closed.  Components keep running.\n"))
+                # On Windows: post WM_CLOSE to our own console window so the
+                # cmd.exe host closes itself too — no orphaned terminal left behind.
+                if IS_WIN:
+                    import ctypes
+                    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                    if hwnd:
+                        ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
                 sys.exit(0)
             case _:
                 pass   # unknown input → silent redraw

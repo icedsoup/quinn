@@ -10,6 +10,7 @@ can send, understand gifs, emojis, and stickers
 ai responses:
 less / no roleplaying
 fix stupidity
+fix admitting its a ai
 less old timey language
 upgrade model
 import my discord message data
