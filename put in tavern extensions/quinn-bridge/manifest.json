@@ -1,0 +1,12 @@
+{
+  "display_name": "Quinn Native DMs",
+  "loading_order": 1,
+  "requires": [],
+  "optional": [],
+  "dependencies": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Quinn",
+  "version": "4.0.0",
+  "auto_update": false
+}

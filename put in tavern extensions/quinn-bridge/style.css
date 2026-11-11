@@ -1,0 +1,8 @@
+.quinn-bridge-panel { margin: 0.5em 0; }
+#qb_panel { padding: 0.75em; border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; }
+#qb_panel label { display: block; }
+#qb_status { margin-top: 0.5em; overflow-wrap: anywhere; }
+.qb_remote_busy::after { content: "Quinn is processing a Discord DM in another tab. Pause that worker before editing."; position: fixed; top: 0; left: 0; right: 0; padding: 1em; background: #302c20; z-index: 99999; }
+.quinn-bridge-buttons { display: flex; flex-wrap: wrap; gap: 0.4em; margin: 0.7em 0; }
+#quinn_bridge_status { display: block; margin-top: 0.5em; opacity: 0.9; }
+.quinn-bridge-note { opacity: 0.75; font-size: 0.9em; }

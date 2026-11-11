@@ -1,0 +1,7 @@
+Levenshtein
+easyocr
+colorama
+opencv-python
+git+https://github.com/dolfies/discord.py-self.git
+pywin32; sys_platform == "win32"
+aiohttp

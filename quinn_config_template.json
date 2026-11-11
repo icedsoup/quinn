@@ -1,0 +1,26 @@
+{
+  "discord_token": "",
+  "bridge_url": "http://127.0.0.1:8765",
+  "bridge_token": "",
+  "respond_to_dms": true,
+  "typing_simulation": true,
+  "typing_rate_per_char": 0.04,
+  "typing_min_seconds": 1.2,
+  "typing_max_seconds": 9.0,
+  "dry_run": false,
+  "log_level": "INFO",
+  "launcher": {
+    "kobold_executable": "koboldcpp.exe",
+    "kobold_config": "config.kcpps",
+    "kobold_url": "http://127.0.0.1:5001",
+    "sillytavern_directory": "SillyTavern",
+    "sillytavern_url": "http://localhost:8000",
+    "node": "node",
+    "kobold_timeout": 180,
+    "bridge_timeout": 10,
+    "tavern_timeout": 60,
+    "browser_timeout": 30,
+    "discord_timeout": 30,
+    "shutdown_timeout": 120
+  }
+}

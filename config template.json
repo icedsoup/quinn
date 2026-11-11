@@ -1,0 +1,38 @@
+{
+    "token": "",
+    "servers": [
+        1234567890
+    ],
+    "channels": [
+        1234567890
+    ],
+    "accuracy": "0.815",
+    "blaccuracy": "0.9",
+    "check_print": true,
+    "print_number": 600,
+    "wishlist_lookup": true,
+    "wishlist_watching_channels": [
+        1234567890
+    ],
+    "min_wishlist": 80,
+    "autodrop": true,
+    "autodropchannel": 1234567890,
+    "dropdelay": 1869,
+    "randmin": 69,
+    "randmax": 220,
+    "autofarm": false,
+    "resourcechannel": 1234567890,
+    "log_hits": false,
+    "log_collection": true,
+    "timestamp": true,
+    "debug": false,
+    "very_verbose": false,
+    "log_drops": true,
+    "log_grabs": true,
+    "log_wishlist": true,
+    "log_autodrop": true,
+    "log_kcd": true,
+    "log_autofarm": true,
+    "clear_console_on_start": true,
+    "lookup_delay": 1.5
+}
