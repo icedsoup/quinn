@@ -1,19 +1,36 @@
 import { setUserAvatar } from '/scripts/personas.js';
-import { saveSettings as persistSettings, setUserName, closeCurrentChat } from '/script.js';
+import { saveSettings as persistSettings, setUserName, closeCurrentChat, setExternalAbortController } from '/script.js';
 const ctx = () => SillyTavern.getContext();
 const literal = value => String(value ?? '').replace(/\{{2,}/g, s => '｛'.repeat(s.length)).replace(/\}{2,}/g, s => '｝'.repeat(s.length)).replace(/<(user|bot|char|group|charifnotgroup)>/gi, '＜$1＞');
 const safe = value => String(value).replace(/[^a-zA-Z0-9 _-]/g, '_').slice(0, 60);
 const settings = () => ctx().extensionSettings.quinnNative ??= { routes: {}, avatars: {} };
 let running = false, busy = false, active = null, error = '', pending = 0, uncertain = 0;
+let jobError = '';
 let releaseWorker = null;
 const channel = new BroadcastChannel('quinn-native-worker');
 let remoteBusy = false;
 let remoteUpdated = 0;
+let telemetryTail = Promise.resolve(), telemetryPending = 0;
+let phase = 'Ready when you are';
 channel.onmessage = event => { remoteUpdated = Date.now(); remoteBusy = event.data.busy; document.body.classList.toggle('qb_remote_busy', remoteBusy); };
 const config = key => localStorage.getItem('quinn_bridge_' + key) || (key === 'url' ? 'http://127.0.0.1:8765' : key === 'char' ? 'Quinn' : '');
 function render() {
     const el = document.getElementById('qb_status');
-    if (el) el.textContent = `${error ? 'Error: ' + error : running ? 'Running' : busy ? 'Pausing' : 'Paused'} · ${pending} pending · ${uncertain} uncertain deliveries`;
+    if (el) {
+        el.textContent = error ? 'Error: ' + error : running ? 'Running' : busy ? 'Pausing' : 'Paused';
+    }
+    const stage = document.getElementById('qb_phase');
+    if (stage) stage.textContent = busy && active ? phase : running ? (jobError ? `Last DM failed: ${jobError}` : 'Listening for incoming DMs') : busy ? 'Finishing the current reply' : 'Ready when you are';
+    for (const [id, value] of [['qb_pending', pending], ['qb_uncertain', uncertain]]) {
+        const item = document.getElementById(id);
+        if (item) item.textContent = String(value);
+    }
+    for (const id of ['qb_url', 'qb_token', 'qb_char', 'qb_save', 'qb_start', 'qb_forget']) {
+        const item = document.getElementById(id);
+        if (item) item.disabled = running || busy;
+    }
+    const pauseButton = document.getElementById('qb_pause');
+    if (pauseButton) pauseButton.disabled = !running;
 }
 async function api(path, data, timeout = 20000) {
     const response = await fetch(config('url').replace(/\/+$/, '') + path, {
@@ -25,21 +42,36 @@ async function api(path, data, timeout = 20000) {
     if (!response.ok) throw Error(body.error || `Bridge HTTP ${response.status}`);
     return body;
 }
-async function st(path, data) {
-    const response = await fetch('/api/' + path, { method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify(data) });
+function telemetry(job, stage, status, detail, metrics = {}) {
+    if (telemetryPending >= (status === 'info' ? 2 : 24)) return;
+    telemetryPending++;
+    const data = { trace: job.job_id, stage, status, detail, metrics };
+    telemetryTail = telemetryTail.then(() => api('/v1/telemetry', data, 1000)).catch(() => {}).finally(() => { telemetryPending--; });
+}
+function phaseStarted(job, stage, detail, metrics = {}) {
+    job.telemetryStage = stage;
+    phase = detail;
+    telemetry(job, stage, 'start', detail, metrics);
+    render();
+}
+async function st(path, data, signal) {
+    const timeout = AbortSignal.timeout(10000);
+    const response = await fetch('/api/' + path, { method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify(data),
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
     if (!response.ok) throw Error(`ST ${path}: HTTP ${response.status}`);
     return response.json();
 }
 async function saveSettings() { await persistSettings(); }
-async function loadChats(avatar) {
-    const list = await st('chats/search', { avatar_url: avatar, query: '' });
+async function loadChats(avatar, mappedFile, signal) {
+    const list = await st('chats/search', { avatar_url: avatar, query: '' }, signal);
     if (!Array.isArray(list)) throw Error('Invalid ST chat listing');
     const result = [];
     for (const item of list) {
         const file = item.file_name.replace(/\.jsonl$/, '');
-        const rows = await st('chats/get', { avatar_url: avatar, file_name: file });
-        if (!Array.isArray(rows) || !rows[0]?.chat_metadata) throw Error('Unreadable chat; refusing to reset');
-        result.push({ file, meta: rows[0].chat_metadata });
+        const rows = await st('chats/get', { avatar_url: avatar, file_name: file }, signal);
+        const meta = Array.isArray(rows) && rows[0]?.chat_metadata;
+        if (meta) result.push({ file, meta });
+        else if (file === mappedFile) throw Error('Unreadable mapped chat; refusing to reset');
     }
     return result;
 }
@@ -74,18 +106,20 @@ function guard(event) {
 }
 for (const event of ['click', 'keydown', 'beforeinput', 'paste', 'drop']) document.addEventListener(event, guard, true);
 function pause() { running = false; if (!busy) releaseWorker?.(); render(); }
-async function process(job) {
+async function process(job, controller) {
+    const { signal } = controller;
+    job.telemetryStage = 'context';
+    const contextStarted = performance.now();
     const c = ctx();
     let index = c.characters.findIndex(x => x.avatar === job.route?.avatar);
     if (index < 0 && job.route?.avatar) throw Error('Mapped Quinn character is missing');
     if (index < 0) index = c.characters.findIndex(x => x.name === config('char'));
     if (index < 0) throw Error('Quinn character not found');
     const avatar = c.characters[index].avatar;
-    const chats = await loadChats(avatar);
+    const chats = await loadChats(avatar, job.route?.file, signal);
     const matches = chats.filter(x => x.meta.quinnNative?.userId === job.user_id && x.meta.quinnNative?.epoch === job.epoch);
     if (matches.length > 1) throw Error('Multiple mapped chats; resolve duplicates before starting');
     if (!matches.length && job.route?.file) {
-
         const result = await reset(job.user_id, 'reset', job);
         job.epoch = result.epoch; job.route = {};
     }
@@ -94,9 +128,10 @@ async function process(job) {
     await c.selectCharacterById(index);
     if (!file) {
         file = `Discord - ${safe(job.display_name)} - ${safe(job.user_id).slice(-6)} - ${crypto.randomUUID()}`;
-        await st('chats/save', { avatar_url: avatar, file_name: file, chat: [{ user_name: literal(job.display_name), character_name: c.characters[index].name, create_date: new Date().toISOString(), chat_metadata: { persona: pid, quinnNative: { userId: job.user_id, epoch: job.epoch } } }] });
+        await st('chats/save', { avatar_url: avatar, file_name: file, chat: [{ user_name: literal(job.display_name), character_name: c.characters[index].name, create_date: new Date().toISOString(), chat_metadata: { persona: pid, quinnNative: { userId: job.user_id, epoch: job.epoch } } }] }, signal);
     }
     await ctx().openCharacterChat(file);
+    signal.throwIfAborted();
     await setUserAvatar(pid, { toastPersonaNameChange: false });
     setUserName(literal(job.display_name), { toastPersonaNameChange: false });
     let current = ctx();
@@ -112,10 +147,12 @@ async function process(job) {
     const route = { avatar, file, persona: pid };
     await api('/v1/people/' + encodeURIComponent(job.user_id), { epoch: job.epoch, route });
     settings().routes[job.user_id] = { ...route, epoch: job.epoch }; await saveSettings();
-    active = { job, file, avatar, controller: new AbortController(), generating: false };
+    active = { job, file, avatar, controller, generating: false };
     const assertContext = () => {
-        if (ctx().chatId !== file || ctx().characters[ctx().characterId]?.avatar !== avatar || active.controller.signal.aborted) throw Error('Chat context changed during generation');
+        active.controller.signal.throwIfAborted();
+        if (ctx().chatId !== file || ctx().characters[ctx().characterId]?.avatar !== avatar) throw Error('Chat context changed during generation');
     };
+    assertContext();
     let user = current.chat.find(x => x.extra?.quinnNative?.jobId === job.job_id && x.is_user);
     let reply = current.chat.find(x => x.extra?.quinnNative?.jobId === job.job_id && !x.is_user);
     if (reply && reply.extra.quinnNative.complete !== true) throw Error('Interrupted reply found. Pause, remove that partial reply, then restart after claim expiry.');
@@ -123,47 +160,100 @@ async function process(job) {
         user = { name: literal(job.display_name), is_user: true, is_system: false, mes: literal(job.message), send_date: new Date().toISOString(), force_avatar: current.getThumbnailUrl('persona', pid), extra: { quinnNative: { jobId: job.job_id, discordId: job.discord_message_id } } };
         current.chat.push(user); current.addOneMessage(user); await current.saveChat();
     }
+    telemetry(job, 'context', 'complete', 'Conversation and persona loaded', {
+        duration_ms: performance.now() - contextStarted,
+        context_messages: current.chat.length,
+        context_chars: current.chat.reduce((count, message) => count + Array.from(message.mes || '').length, 0),
+    });
+    let verificationStarted;
     if (!reply) {
+        assertContext();
         const before = current.chat.length;
         if (document.querySelector('#send_textarea')?.value) throw Error('Clear or save the ST draft before starting the worker');
         active.generating = true;
+        active.inferenceStarted = performance.now();
+        active.streamUpdates = 0;
+        active.lastStreamReport = 0;
+        phaseStarted(job, 'inference', 'Generating a reply');
         // SillyTavern summarization can trigger nested generation.
         const memory = current.extensionSettings.memory;
         const frozen = memory?.memoryFrozen;
         if (memory) memory.memoryFrozen = true;
-        try { await current.generate('normal', { automatic_trigger: true, signal: active.controller.signal }); }
-        finally { if (memory) memory.memoryFrozen = frozen; }
+        const stop = () => current.stopGeneration();
+        controller.signal.addEventListener('abort', stop, { once: true });
+        const deadline = setTimeout(() => controller.abort(Error('Generation exceeded 60 seconds.')), 60000);
+        try {
+            setExternalAbortController(controller);
+            await current.generate('normal', { automatic_trigger: true, signal: controller.signal });
+        } catch (e) {
+            controller.signal.throwIfAborted();
+            throw e;
+        } finally {
+            clearTimeout(deadline);
+            controller.signal.removeEventListener('abort', stop);
+            if (memory) memory.memoryFrozen = frozen;
+        }
         active.generating = false;
         assertContext();
         const added = ctx().chat.slice(before).filter(x => !x.is_user && !x.is_system && x.mes?.trim());
         if (added.length !== 1) throw Error('Expected exactly one native assistant reply');
         reply = added[0];
+        telemetry(job, 'inference', 'complete', 'Generation finished', {
+            duration_ms: performance.now() - active.inferenceStarted,
+            output_chars: Array.from(reply.mes).length,
+            stream_updates: active.streamUpdates,
+            ...(active.firstOutputMs === undefined ? {} : { first_output_ms: active.firstOutputMs }),
+        });
         reply.mes = literal(reply.mes);
         reply.extra ??= {}; reply.extra.quinnNative = { jobId: job.job_id, discordId: job.discord_message_id, complete: true };
+        phaseStarted(job, 'reply', 'Saving and verifying the reply');
+        verificationStarted = performance.now();
         await ctx().saveChat();
+    } else {
+        telemetry(job, 'inference', 'skipped', 'Recovered a completed reply from the conversation', { output_chars: Array.from(reply.mes).length });
+    }
+    if (verificationStarted === undefined) {
+        phaseStarted(job, 'reply', 'Verifying the saved reply');
+        verificationStarted = performance.now();
     }
     assertContext();
-    const saved = await st('chats/get', { avatar_url: avatar, file_name: file });
+    const saved = await st('chats/get', { avatar_url: avatar, file_name: file }, signal);
     if (!Array.isArray(saved) || !saved.some(x => !x.is_user && x.extra?.quinnNative?.jobId === job.job_id && x.mes === reply.mes)) {
         throw Error('Reply was not persisted; delivery suppressed');
     }
+    assertContext();
     await api(`/v1/jobs/${job.job_id}/complete`, { claim_token: job.claim_token, reply: reply.mes, route });
+    telemetry(job, 'reply', 'complete', 'Saved reply released for delivery', {
+        duration_ms: performance.now() - verificationStarted, output_chars: Array.from(reply.mes).length,
+    });
 }
 async function tick() {
     if (!running || busy) return;
     busy = true; channel.postMessage({ busy: true }); render();
-    let job, heartbeat;
+    let job, heartbeat, deadline;
     try {
         job = await api('/v1/next?worker=4');
         if (job.job_id) {
-            heartbeat = setInterval(() => api(`/v1/jobs/${job.job_id}/heartbeat`, { claim_token: job.claim_token }).catch(e => { active?.controller.abort(); error = e.message; pause(); }), 15000);
-            await process(job);
+            const controller = new AbortController();
+            deadline = setTimeout(() => controller.abort(Error('The DM job exceeded 90 seconds.')), 90000);
+            heartbeat = setInterval(() => api(`/v1/jobs/${job.job_id}/heartbeat`, { claim_token: job.claim_token }, 2000).catch(e => controller.abort(e)), 15000);
+            await process(job, controller);
+            jobError = '';
         }
     } catch (e) {
-        error = e.message; running = false;
+        const message = String(e?.message || e).slice(0, 500);
+        if (job?.job_id) {
+            jobError = message;
+            telemetry(job, job.telemetryStage || 'context', 'error', message);
+            await api(`/v1/jobs/${job.job_id}/fail`, { claim_token: job.claim_token, error: message }, 2000).catch(() => {});
+        } else {
+            error = message;
+            running = false;
+        }
 
         console.error('[Quinn Native]', e);
     } finally {
+        clearTimeout(deadline);
         clearInterval(heartbeat); active = null; busy = false; channel.postMessage({ busy: running });
         if (!running) releaseWorker?.(); render();
     }
@@ -173,7 +263,7 @@ function start() {
     if (busy || !config('token')) return Promise.reject(Error('Set the bridge token and wait until paused'));
     return new Promise((resolve, reject) => navigator.locks.request('quinn-bridge-worker', { ifAvailable: true }, async lock => {
         if (!lock) { error = 'Another worker owns this browser session'; render(); reject(Error(error)); return; }
-        error = ''; running = true; channel.postMessage({ busy: true }); render();
+        error = ''; jobError = ''; running = true; channel.postMessage({ busy: true }); render();
         resolve();
         await new Promise(resolve => { releaseWorker = resolve; });
         releaseWorker = null;
@@ -249,8 +339,29 @@ function init() {
     const c = ctx();
     for (const key of ['generate','openCharacterChat','saveChat','saveMetadata','selectCharacterById','powerUserSettings']) if (!c[key]) { error = 'Unsupported ST: missing ' + key; return; }
     const host = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
-    const panel = document.createElement('div'); panel.id = 'qb_panel';
-    panel.innerHTML = '<h4>Quinn Native DMs</h4><label>Bridge URL<input id="qb_url" class="text_pole"></label><label>Token<input id="qb_token" class="text_pole" type="password"></label><label>Quinn character<input id="qb_char" class="text_pole"></label><button id="qb_save" class="menu_button">Save</button><button id="qb_start" class="menu_button">Start</button><button id="qb_pause" class="menu_button">Pause to manage</button><button id="qb_forget" class="menu_button">Forget person in this chat</button><div id="qb_status"></div><p>DMs only. Pause before managing chats. Manual ST replies stay local.</p>';
+    const panel = document.createElement('div'); panel.id = 'qb_panel'; panel.className = 'inline-drawer';
+    panel.innerHTML = `
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Quinn Native DMs</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <label for="qb_url">Bridge address</label>
+            <input id="qb_url" class="text_pole" type="url" spellcheck="false" autocomplete="off">
+            <label for="qb_token">Bridge token</label>
+            <input id="qb_token" class="text_pole" type="password" autocomplete="off">
+            <label for="qb_char">Character</label>
+            <input id="qb_char" class="text_pole" autocomplete="off">
+            <div class="flex-container">
+                <button id="qb_save" class="menu_button">Save</button>
+                <button id="qb_start" class="menu_button">Start</button>
+                <button id="qb_pause" class="menu_button">Pause to manage</button>
+            </div>
+            <div id="qb_status" role="status"></div>
+            <small><span id="qb_phase"></span> · Queued <span id="qb_pending">0</span> · Uncertain deliveries <span id="qb_uncertain">0</span></small>
+            <p>Pause before editing conversations. Check Discord before resending an uncertain delivery.</p>
+            <button id="qb_forget" class="menu_button">Forget person in this chat</button>
+        </div>`;
     host.append(panel);
     for (const key of ['url','token','char']) document.getElementById('qb_' + key).value = config(key);
     document.getElementById('qb_save').onclick = () => { if (running || busy) return; for (const key of ['url','token','char']) localStorage.setItem('quinn_bridge_' + key, document.getElementById('qb_' + key).value.trim()); };
@@ -260,7 +371,7 @@ function init() {
     const events = c.eventTypes;
     c.eventSource.on(events.GENERATION_STARTED, () => {
         if (!active) return;
-        if (!active.generating || active.started) { active.controller.abort(); throw Error('Competing generation blocked'); }
+        if (!active.generating || active.started) { const reason = Error('Competing generation blocked'); active.controller.abort(reason); throw reason; }
         active.started = true;
     });
     c.eventSource.on(events.MESSAGE_RECEIVED, index => {
@@ -271,7 +382,20 @@ function init() {
             message.extra.quinnNative = { jobId: active.job.job_id, discordId: active.job.discord_message_id, complete: false };
         }
     });
-    c.eventSource.on(events.CHAT_CHANGED, () => { if (active && ctx().chatId !== active.file) { active.controller.abort(); pause(); } });
+    if (events.STREAM_TOKEN_RECEIVED) c.eventSource.on(events.STREAM_TOKEN_RECEIVED, text => {
+        if (!active?.generating || ctx().chatId !== active.file || typeof text !== 'string') return;
+        active.streamUpdates++;
+        const now = performance.now();
+        if (text && active.firstOutputMs === undefined) active.firstOutputMs = now - active.inferenceStarted;
+        if (now - active.lastStreamReport < 250) return;
+        active.lastStreamReport = now;
+        telemetry(active.job, 'inference', 'info', 'Receiving generated text', {
+            elapsed_ms: now - active.inferenceStarted, output_chars: Array.from(text).length,
+            stream_updates: active.streamUpdates,
+            ...(active.firstOutputMs === undefined ? {} : { first_output_ms: active.firstOutputMs }),
+        });
+    });
+    c.eventSource.on(events.CHAT_CHANGED, () => { if (active && ctx().chatId !== active.file) active.controller.abort(Error('Chat context changed during generation')); });
     c.eventSource.on(events.CHAT_DELETED, async name => {
         for (const [uid, route] of Object.entries(settings().routes)) if (route.file === String(name).replace(/\.jsonl$/, '')) {
             active?.controller.abort(); pause();

@@ -15,7 +15,7 @@
         1234567890
     ],
     "min_wishlist": 80,
-    "autodrop": true,
+    "autodrop": false,
     "autodropchannel": 1234567890,
     "dropdelay": 1869,
     "randmin": 69,

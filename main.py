@@ -10,6 +10,7 @@ import unicodedata
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
+from time import perf_counter
 
 import discord
 from colorama import init
@@ -18,6 +19,7 @@ from lib import api
 from lib.imageapi import ocr_image, ocr_print_number
 from lib.ocr import card_count, get_bottom, get_card, get_print, get_top
 from console import KarutaConsole, R, C_TEAL, C_PURPLE, C_AMBER, C_MINT, C_CORAL, C_GRAY, C_DIM, C_WHITE, C_GOLD
+from telemetry import emit
 
 init(convert=True)
 match = "(is dropping [3-4] cards!)|(I'm dropping [3-4] cards since this server is currently active!)"
@@ -57,8 +59,7 @@ cprint = config["check_print"]
 autofarm = config["autofarm"]
 verbose = config["very_verbose"]
 
-if autofarm:
-    resourcechannel = config["resourcechannel"]
+resourcechannel = config.get("resourcechannel")
 min_wishlist = int(config.get("min_wishlist", 50))
 wishlist_lookup_enabled = config.get("wishlist_lookup", True)
 wishlist_watching_channels = config.get("wishlist_watching_channels", channels)
@@ -151,6 +152,10 @@ def _parse_char_line(line: str):
     return (line, None)
 
 
+class ChannelConfigurationError(Exception):
+    pass
+
+
 class Main(discord.Client):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -168,8 +173,10 @@ class Main(discord.Client):
         self.lookup_next_at = 0.0
         self.lookup_lock = asyncio.Lock()
         self.drop_lock = asyncio.Lock()
+        self.pending_claims = {}
 
     async def on_ready(self):
+        emit('sniper', 'connection', 'complete', 'Connected to Discord', channels=len(channels))
         for guild_id in guilds:
             guild = self.get_guild(guild_id)
             if guild is None:
@@ -179,7 +186,7 @@ class Main(discord.Client):
 
         if self.ready:
             return
-        if clear_console_on_start:
+        if clear_console_on_start and sys.stdout.isatty():
             await asyncio.create_subprocess_shell("cls" if title else "clear")
         await asyncio.sleep(0.5)
         if sys.gettrace() is None:
@@ -253,6 +260,9 @@ class Main(discord.Client):
             spawn(self.autofarm(), "autofarm")
         self.ready = True
 
+    async def on_disconnect(self):
+        emit('sniper', 'connection', 'stopped', 'Discord connection interrupted')
+
     async def on_message(self, message):
         cid = message.channel.id
 
@@ -284,7 +294,12 @@ class Main(discord.Client):
         if re.search("A wishlisted card is dropping!", message.content):
             dprint("Wishlisted card detected")
 
-        if self.grab_timer == 0 and message.attachments and re.search(match, message.content):
+        is_drop = bool(message.attachments and re.search(match, message.content))
+        trace = str(message.id)
+        if is_drop and self.grab_timer > 0:
+            emit('sniper', 'intake', 'skipped', 'Drop skipped during grab cooldown', trace=trace, grab_seconds=self.grab_timer)
+        if self.grab_timer == 0 and is_drop:
+            emit('sniper', 'intake', 'complete', f'Drop received in #{message.channel.name}', trace=trace, channel=message.channel.name)
             if isbutton(cid):
                 edit_task = asyncio.get_running_loop().create_task(
                     self.wait_for("message_edit", check=mcheck, timeout=BUTTON_WINDOW)
@@ -297,10 +312,11 @@ class Main(discord.Client):
             try:
                 async with self.drop_lock:
                     if self.grab_timer != 0:
+                        emit('sniper', 'intake', 'skipped', 'Another claim started while waiting to scan', trace=trace, grab_seconds=self.grab_timer)
                         return
 
                     try:
-                        charlist, anilist, printlist = await self.scan_drop(message.attachments[0])
+                        charlist, anilist, printlist = await self.scan_drop(message.attachments[0], trace)
                     except (discord.HTTPException, OSError, ValueError) as exc:
                         dprint(f"Skipping unreadable drop: {exc}")
                         return
@@ -318,14 +334,18 @@ class Main(discord.Client):
 
                     grab_idx = -1
                     grab_reason = ""
+                    matching_started = perf_counter()
+                    emit('sniper', 'match', 'start', 'Comparing recognized cards with configured rules', trace=trace,
+                         characters=len(self.chars), series_rules=len(self.animes), threshold=accuracy, blacklist_threshold=blaccuracy)
 
                     char_matches = []
                     for i, character in enumerate(charlist):
-                        if (
-                            api.isSomethingChar(character, anilist[i], self.chars, accuracy)
-                            and not api.isSomething(character, self.charblacklist, accuracy)
-                            and not api.isSomething(anilist[i], self.aniblacklist, blaccuracy)
-                        ):
+                        matched = api.isSomethingChar(character, anilist[i], self.chars, accuracy)
+                        blocked = matched and (api.isSomething(character, self.charblacklist, accuracy)
+                                                or api.isSomething(anilist[i], self.aniblacklist, blaccuracy))
+                        emit('sniper', 'match', 'info', f'Card {i + 1} · {character}: ' + ('blocked by blacklist' if blocked else 'character rule matched' if matched else 'no character rule'),
+                             trace=trace, card=i + 1, character=character, series=anilist[i], rule='character', matched=bool(matched), blocked=bool(blocked))
+                        if matched and not blocked:
                             kw_idx = self.keyword_match_priority_char(character, anilist[i], self.chars, accuracy)
                             char_matches.append((i, kw_idx, character))
 
@@ -346,11 +366,12 @@ class Main(discord.Client):
                     if grab_idx == -1:
                         anime_matches = []
                         for i, anime in enumerate(anilist):
-                            if (
-                                api.isSomething(anime, self.animes, accuracy)
-                                and not api.isSomething(charlist[i], self.charblacklist, accuracy)
-                                and not api.isSomething(anime, self.aniblacklist, blaccuracy)
-                            ):
+                            matched = api.isSomething(anime, self.animes, accuracy)
+                            blocked = matched and (api.isSomething(charlist[i], self.charblacklist, accuracy)
+                                                    or api.isSomething(anime, self.aniblacklist, blaccuracy))
+                            emit('sniper', 'match', 'info', f'Card {i + 1} · {anime}: ' + ('blocked by blacklist' if blocked else 'series rule matched' if matched else 'no series rule'),
+                                 trace=trace, card=i + 1, character=charlist[i], series=anime, rule='series', matched=bool(matched), blocked=bool(blocked))
+                            if matched and not blocked:
                                 kw_idx = self.keyword_match_priority(anime, self.animes, accuracy)
                                 anime_matches.append((i, kw_idx, anime))
 
@@ -370,6 +391,9 @@ class Main(discord.Client):
 
                     if grab_idx == -1 and cprint:
                         for i, prin in enumerate(printlist):
+                            emit('sniper', 'match', 'info', f'Card {i + 1} · print {prin if prin != 9999999 else "unreadable"}',
+                                 trace=trace, card=i + 1, print_number=prin if prin != 9999999 else None, print_threshold=pn,
+                                 rule='print', matched=prin <= pn and anilist[i] not in self.aniblacklist and charlist[i] not in self.charblacklist)
                             if (
                                 prin <= pn
                                 and anilist[i] not in self.aniblacklist
@@ -387,19 +411,25 @@ class Main(discord.Client):
                                         )
                                 break
 
+                    emit('sniper', 'match', 'complete', self.grab_reason if grab_idx != -1 else 'No character, series, or print rule matched', trace=trace,
+                         duration_ms=round((perf_counter() - matching_started) * 1000, 1), matched=grab_idx != -1,
+                         card=grab_idx + 1 if grab_idx != -1 else None, character=charlist[grab_idx] if grab_idx != -1 else '',
+                         series=anilist[grab_idx] if grab_idx != -1 else '')
                     if grab_idx != -1:
                         drop_print(f"{C_TEAL}[{message.channel.name}]{R}  {grab_reason}")
                         self.url = message.attachments[0].url
 
                         if edit_task:
-                            await self.grab_with_button(grab_idx, edit_task, buttons_ref, drop_print)
+                            await self.grab_with_button(grab_idx, edit_task, buttons_ref, drop_print, trace, cid)
                         else:
-                            await self.react_add(message, CARD_REACTIONS[grab_idx])
+                            await self.react_add(message, CARD_REACTIONS[grab_idx], trace)
 
                 console.set_state("IDLE")
 
                 if grab_idx == -1 and wishlist_lookup_enabled and cid in wishlist_watching_channels:
                     await self.do_wishlist_lookup(message, charlist, anilist, edit_task, buttons_ref)
+                elif grab_idx == -1:
+                    emit('sniper', 'wishlist', 'skipped', 'Wishlist lookup is disabled for this channel', trace=trace)
             finally:
                 if edit_task:
                     edit_task.cancel()
@@ -418,6 +448,8 @@ class Main(discord.Client):
             self.grab_timer = 600
             self.missed    -= 1
             self.collected += 1
+            emit('sniper', 'claim', 'complete', f'Collection confirmed: {a.group(1)}', trace=self.pending_claims.pop(cid, trace),
+                 character=a.group(1), collected=self.collected, unconfirmed=max(self.missed, 0), grab_seconds=self.grab_timer)
             console.collected = self.collected
             console.missed = self.missed
             grab_print(f"{C_TEAL}[{message.channel.name}]{R}  Obtained  {C_MINT}{a.group(1)}{R}")
@@ -436,34 +468,64 @@ class Main(discord.Client):
             dprint("Generosity blessing detected — resetting drop cd")
             self.drop_timer = 0
 
-    async def scan_drop(self, attachment):
+    async def scan_drop(self, attachment, trace=None):
         crops = OCR_DIR / "char"
         crops.mkdir(parents=True, exist_ok=True)
         image = OCR_DIR / "card.webp"
-        await attachment.save(image)
-        count = card_count(image)
-        chars, animes, prints = [], [], []
-        for index in range(count):
-            card = OCR_DIR / f"card{index + 1}.png"
-            top = crops / f"top{index + 1}.png"
-            bottom = crops / f"bottom{index + 1}.png"
-            await get_card(card, image, index)
-            await get_top(card, top)
-            await get_bottom(card, bottom)
-            chars.append(self.normalize_ocr_text(await self.ocr_best(str(top))))
-            animes.append(self.normalize_ocr_text(await self.ocr_best(str(bottom))))
-            if cprint:
-                strip = crops / f"print{index + 1}.png"
-                await get_print(card, strip)
-                prints.append(await asyncio.to_thread(ocr_print_number, str(strip)))
-            else:
-                prints.append("9999999")
+        started = perf_counter()
+        emit('sniper', 'download', 'start', 'Downloading drop image', trace=trace)
+        try:
+            await attachment.save(image)
+            count = card_count(image)
+        except Exception as exc:
+            emit('sniper', 'download', 'error', str(exc), trace=trace)
+            raise
+        emit('sniper', 'download', 'complete', f'Drop image ready · {count} cards', trace=trace, cards=count,
+             duration_ms=round((perf_counter() - started) * 1000, 1), image_bytes=image.stat().st_size)
+        started = perf_counter()
+        emit('sniper', 'ocr', 'start', 'Reading character names, series, and print numbers', trace=trace, cards=count, engine='EasyOCR', device='CPU')
+        try:
+            chars, animes, prints = [], [], []
+            for index in range(count):
+                card = OCR_DIR / f"card{index + 1}.png"
+                top = crops / f"top{index + 1}.png"
+                bottom = crops / f"bottom{index + 1}.png"
+                await get_card(card, image, index)
+                await get_top(card, top)
+                await get_bottom(card, bottom)
+                chars.append(self.normalize_ocr_text(await self.ocr_best(str(top), trace, index + 1, 'character')))
+                animes.append(self.normalize_ocr_text(await self.ocr_best(str(bottom), trace, index + 1, 'series')))
+                if cprint:
+                    strip = crops / f"print{index + 1}.png"
+                    await get_print(card, strip)
+                    prints.append(await asyncio.to_thread(ocr_print_number, str(strip), trace, index + 1))
+                else:
+                    prints.append("9999999")
+        except Exception as exc:
+            emit('sniper', 'ocr', 'error', str(exc), trace=trace)
+            raise
+        emit('sniper', 'ocr', 'complete', f'Read {count} cards', trace=trace, cards=count,
+             duration_ms=round((perf_counter() - started) * 1000, 1), passes=count * (3 if cprint else 2))
         return chars, animes, prints
 
 
     async def do_wishlist_lookup(self, message, charlist, anilist, edit_task, buttons_ref):
+        trace = str(message.id)
+        started = perf_counter()
+        emit('sniper', 'wishlist', 'start', 'Checking wishlist counts', trace=trace, wishlist_threshold=min_wishlist)
+        try:
+            await self._wishlist_lookup(message, charlist, anilist, edit_task, buttons_ref)
+        except Exception as exc:
+            emit('sniper', 'wishlist', 'error', str(exc), trace=trace)
+            raise
+        else:
+            emit('sniper', 'wishlist', 'complete', 'Wishlist checks finished', trace=trace, duration_ms=round((perf_counter() - started) * 1000, 1))
+
+    async def _wishlist_lookup(self, message, charlist, anilist, edit_task, buttons_ref):
+        trace = str(message.id)
         if self.grab_timer != 0:
             dprint(f"Grab on cooldown ({self.grab_timer}s) — skipping wishlist lookup")
+            emit('sniper', 'wishlist', 'info', 'Grab cooldown prevents lookup', trace=trace, grab_seconds=self.grab_timer)
             return
 
         channel = self.get_channel(autodropchannel) if autodropchannel else None
@@ -482,13 +544,16 @@ class Main(discord.Client):
             series = self.normalize_ocr_text(fix_ocr_spaces(anilist[i].strip()))
 
             if not query_name:
+                emit('sniper', 'wishlist', 'info', f'Card {i + 1} has no readable name', trace=trace, card=i + 1)
                 continue
 
             if api.isSomething(name, self.charblacklist, blaccuracy):
                 dprint(f"WL: skipping blacklisted character: {name}")
+                emit('sniper', 'wishlist', 'info', f'Card {i + 1} excluded by character blacklist', trace=trace, card=i + 1, blocked=True)
                 continue
             if series and api.isSomething(series, self.aniblacklist, blaccuracy):
                 dprint(f"WL: skipping blacklisted anime: {series}")
+                emit('sniper', 'wishlist', 'info', f'Card {i + 1} excluded by series blacklist', trace=trace, card=i + 1, blocked=True)
                 continue
 
             query = f"clu {query_series} {query_name}" if query_series else f"clu {query_name}"
@@ -498,6 +563,7 @@ class Main(discord.Client):
                 wait_time = self.lookup_next_at - now
                 if wait_time > 0:
                     wl_print(f"{C_AMBER}Rate limit — waiting {wait_time:.1f}s{R}")
+                    emit('sniper', 'wishlist', 'info', 'Waiting for lookup rate limit', trace=trace, wait_seconds=round(wait_time, 2))
                     await asyncio.sleep(wait_time)
 
                 if self.grab_timer != 0:
@@ -516,11 +582,13 @@ class Main(discord.Client):
                         ),
                 ))
                 try:
+                    emit('sniper', 'wishlist', 'info', f'Looking up {query_name}', trace=trace, card=i + 1, character=query_name, series=query_series)
                     await channel.send(query)
                     self.lookup_next_at = asyncio.get_running_loop().time() + lookup_delay
                     resp = await response
                 except asyncio.TimeoutError:
                     wl_print(f"{C_AMBER}Timeout waiting for clu response for:{R} {query_name}")
+                    emit('sniper', 'wishlist', 'info', f'Lookup timed out for {query_name}', trace=trace, card=i + 1, timed_out=True)
                     continue
                 finally:
                     if not response.done():
@@ -569,6 +637,8 @@ class Main(discord.Client):
                 f"WL: {query_name} ({query_series})  →  "
                 f"{wl if wl >= 0 else '?'} wishlists"
             )
+            emit('sniper', 'wishlist', 'info', f'{query_name}: {wl if wl >= 0 else "unknown"} wishlists', trace=trace,
+                 card=i + 1, character=query_name, wishlist_count=wl if wl >= 0 else None, wishlist_threshold=min_wishlist)
 
             if wl > best_wl:
                 best_wl = wl
@@ -578,6 +648,8 @@ class Main(discord.Client):
                 await asyncio.sleep(random.uniform(0.3, 0.8))
 
         if best_idx == -1 or best_wl < min_wishlist:
+            emit('sniper', 'wishlist', 'info', 'No card meets the wishlist threshold', trace=trace,
+                 wishlist_count=best_wl if best_wl >= 0 else None, wishlist_threshold=min_wishlist, matched=False)
             wl_print(
                 f"Best wishlist: {C_CORAL}{best_wl if best_wl >= 0 else '?'}{R} — "
                 f"below threshold ({C_AMBER}{min_wishlist}{R}), skipping"
@@ -591,6 +663,8 @@ class Main(discord.Client):
         wl_print(f"Grabbing {C_MINT}{charlist[best_idx]}{R} with {C_GOLD}{best_wl}{R} wishlists")
         self.url = message.attachments[0].url
         self.grab_reason = f"Wishlist ({best_wl}): {charlist[best_idx]} from {anilist[best_idx]}"
+        emit('sniper', 'wishlist', 'info', self.grab_reason, trace=trace,
+             card=best_idx + 1, character=charlist[best_idx], wishlist_count=best_wl, matched=True)
 
         if loghits:
             with LOG_PATH.open("a", encoding="utf-8") as ff:
@@ -601,40 +675,57 @@ class Main(discord.Client):
                 )
 
         if edit_task:
-            await self.grab_with_button(best_idx, edit_task, buttons_ref, wl_print)
+            await self.grab_with_button(best_idx, edit_task, buttons_ref, wl_print, trace, message.channel.id)
         else:
-            await self.react_add(message, CARD_REACTIONS[best_idx])
+            await self.react_add(message, CARD_REACTIONS[best_idx], trace)
 
-    async def grab_with_button(self, index, edit_task, buttons_ref, report):
+    async def grab_with_button(self, index, edit_task, buttons_ref, report, trace=None, channel_id=None):
+        emit('sniper', 'claim', 'start', f'Waiting to claim card {index + 1}', trace=trace, card=index + 1, method='button')
         try:
             await edit_task
             buttons = buttons_ref[0]
             if not buttons or index >= len(buttons):
                 report(f"{C_CORAL}Button {index + 1} is unavailable{R}")
+                emit('sniper', 'claim', 'error', 'Card button unavailable', trace=trace, card=index + 1)
                 return
             await asyncio.sleep(random.uniform(0.1, 0.35))
             await buttons[index].click()
         except asyncio.TimeoutError:
             report(f"{C_CORAL}Timed out waiting for the card buttons{R}")
+            emit('sniper', 'claim', 'error', 'Timed out waiting for card buttons', trace=trace)
         except discord.errors.InvalidData:
             report(f"{C_CORAL}Discord did not acknowledge the card grab{R}")
+            emit('sniper', 'claim', 'error', 'Discord did not acknowledge the card grab', trace=trace)
         except Exception as exc:
             report(f"{C_CORAL}Button grab failed: {exc}{R}")
+            emit('sniper', 'claim', 'error', str(exc), trace=trace)
         else:
             await self.afterclick()
+            self.pending_claims[channel_id] = trace
+            emit('sniper', 'claim', 'info', 'Claim submitted; waiting for collection confirmation', trace=trace,
+                 card=index + 1, grab_seconds=self.grab_timer, unconfirmed=max(self.missed, 0))
 
-    async def react_add(self, message, emoji):
+    async def react_add(self, message, emoji, trace=None):
+        trace = trace or str(message.id)
+        emit('sniper', 'claim', 'start', 'Submitting card reaction', trace=trace, method='reaction', card=CARD_REACTIONS.index(emoji) + 1)
         try:
             dprint("Attempting to react")
             await asyncio.sleep(random.uniform(0.1, 0.35))
             await message.add_reaction(emoji)
         except discord.errors.Forbidden as exc:
             dprint(f"React failed: {exc}")
+            emit('sniper', 'claim', 'error', str(exc), trace=trace)
             return
+        except Exception as exc:
+            emit('sniper', 'claim', 'error', str(exc), trace=trace)
+            raise
         self.grab_timer = GRAB_ATTEMPT_COOLDOWN
         console.grab_timer = self.grab_timer
         self.missed       += 1
         console.missed = self.missed
+        self.pending_claims[message.channel.id] = trace
+        emit('sniper', 'claim', 'info', 'Reaction sent; waiting for collection confirmation', trace=trace,
+             grab_seconds=self.grab_timer, unconfirmed=max(self.missed, 0))
         dprint(f"Reacted with {emoji} — grab cd set to {GRAB_ATTEMPT_COOLDOWN}s")
 
 
@@ -723,9 +814,9 @@ class Main(discord.Client):
         return Main._base_normalize(text)
 
 
-    async def ocr_best(self, image_path):
+    async def ocr_best(self, image_path, trace=None, card=None, field='text'):
         def _run():
-            text = ocr_image(image_path)
+            text = ocr_image(image_path, trace, card, field)
             dprint(f"ocr_best [{image_path}]: '{text}'")
             return text
         return await asyncio.to_thread(_run)
@@ -743,11 +834,17 @@ class Main(discord.Client):
             console.drop_timer = self.drop_timer
             console.collected = self.collected
             console.missed = self.missed
+            emit('sniper', 'cooldown', 'info', 'Runtime counters', grab_seconds=self.grab_timer,
+                 drop_seconds=self.drop_timer, collected=self.collected, unconfirmed=max(self.missed, 0))
+            if self.grab_timer == 0 and self.pending_claims:
+                for pending_trace in self.pending_claims.values():
+                    emit('sniper', 'claim', 'skipped', 'Cooldown expired without collection confirmation', trace=pending_trace, confirmed=False)
+                self.pending_claims.clear()
 
             if console.state in ("WAITING", "IDLE"):
                 console.set_state("WAITING" if self.grab_timer > 0 else "IDLE")
 
-            if title:
+            if title and sys.stdout.isatty():
                 grab_str = f"Grab: {self.grab_timer}s" if self.grab_timer > 0 else "Grab: ready"
                 drop_str = f"Drop: {self.drop_timer}s" if self.drop_timer > 0 else "Drop: ready"
                 await asyncio.create_subprocess_shell(
@@ -805,8 +902,30 @@ class Main(discord.Client):
                 dprint("Config reloaded")
 
 
+    async def configured_channel(self, field, channel_id):
+        if type(channel_id) is not int or channel_id <= 0 or channel_id == 1234567890:
+            raise ChannelConfigurationError(f"Set {field} to a real numeric Discord channel ID in config.json and restart Sniper.")
+        channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            raise ChannelConfigurationError(f"{field} must be a channel that accepts messages. Update config.json and restart Sniper.")
+        return channel
+
     async def autofarm(self):
-        channel = self.get_channel(resourcechannel)
+        while True:
+            try:
+                channel = await self.configured_channel('resourcechannel', resourcechannel)
+                await self.farm_in(channel)
+            except ChannelConfigurationError as exc:
+                tprint(f"{C_CORAL}[Autofarm] {exc}{R}")
+                return
+            except (discord.Forbidden, discord.NotFound):
+                tprint(f"{C_CORAL}[Autofarm] Cannot access or send to channel {resourcechannel}. Check the channel ID and permissions, then restart Sniper.{R}")
+                return
+            except discord.HTTPException as exc:
+                tprint(f"{C_CORAL}[Autofarm] {exc} — retrying in 30s{R}")
+                await asyncio.sleep(30)
+
+    async def farm_in(self, channel):
         while True:
             async with channel.typing():
                 await asyncio.sleep(random.uniform(0.2, 1))
@@ -831,22 +950,21 @@ class Main(discord.Client):
                 if message is not None:
                     reply = await self.wait_for(
                         "message",
-                        check=lambda m: m.author.id == KARUTA_ID
+                        check=lambda m: m.author.id == KARUTA_ID and m.channel.id == channel.id
                     )
                     if reply:
-                        await self.autofindresource()
+                        await self.autofindresource(channel)
                         await reply.components[0].children[1].click()
                         farm_print("Autofarm - Worked successfully!")
                         await asyncio.sleep(12 * 3600 + 5)
 
-    async def autofindresource(self):
-        channel = self.get_channel(resourcechannel)
+    async def autofindresource(self, channel):
         async with channel.typing():
             await asyncio.sleep(random.uniform(0.2, 1))
         await channel.send("kn")
         reply = await self.wait_for(
             "message",
-            check=lambda m: m.author.id == KARUTA_ID
+            check=lambda m: m.author.id == KARUTA_ID and m.channel.id == channel.id and bool(m.embeds)
         )
         a = re.compile(
             r"`(\w+)` · \*\*(\d+)%\*\* tax · \*\*(\d+)(%\*\* power · \*\*(\d+)|\*)",
@@ -868,7 +986,6 @@ class Main(discord.Client):
 
 
     async def autodrop(self):
-        channel = self.get_channel(autodropchannel)
         first_run = True
         while True:
             try:
@@ -876,6 +993,7 @@ class Main(discord.Client):
                     await asyncio.sleep(dropdelay + random.randint(randmin, randmax))
                 first_run = False
 
+                channel = await self.configured_channel('autodropchannel', autodropchannel)
                 grab_wait, drop_wait = await self.check_kcd(channel)
                 wait_secs = max(grab_wait, drop_wait)
                 if wait_secs > 0:
@@ -898,6 +1016,13 @@ class Main(discord.Client):
 
             except asyncio.CancelledError:
                 raise
+            except ChannelConfigurationError as exc:
+                tprint(f"{C_CORAL}[Autodrop] {exc}{R}")
+                return
+            except (discord.Forbidden, discord.NotFound):
+                console.set_state("IDLE")
+                tprint(f"{C_CORAL}[Autodrop] Cannot access or send to channel {autodropchannel}. Check the channel ID and permissions, then restart Sniper.{R}")
+                return
             except Exception as e:
                 tprint(f"{C_CORAL}[Autodrop] Error ({type(e).__name__}: {e}) — retrying in 30s{R}")
                 console.set_state("IDLE")

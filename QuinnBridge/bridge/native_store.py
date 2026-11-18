@@ -7,6 +7,9 @@ import uuid
 from contextlib import contextmanager
 from urllib.parse import urlparse, parse_qs
 
+BROWSER_LEASE = 15
+JOB_DEADLINE = 90
+
 
 @contextmanager
 def connection(path):
@@ -27,14 +30,39 @@ def initialize(path):
         CREATE TABLE IF NOT EXISTS native_jobs (
           id TEXT PRIMARY KEY, discord_id TEXT UNIQUE NOT NULL, user_id TEXT NOT NULL,
           epoch INTEGER NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL,
-          claim TEXT, touched REAL, reply TEXT, delivery_token TEXT,
+          claim TEXT, touched REAL, claimed_at REAL, reply TEXT, delivery_token TEXT,
           sent_id TEXT, error TEXT);
         CREATE TABLE IF NOT EXISTS native_meta (key TEXT PRIMARY KEY, value TEXT);
         ''')
+        if 'claimed_at' not in {row[1] for row in db.execute('PRAGMA table_info(native_jobs)')}:
+            db.execute('ALTER TABLE native_jobs ADD COLUMN claimed_at REAL')
         # Legacy records are never a history source or eligible for native claims.
         if db.execute("SELECT 1 FROM sqlite_master WHERE name='jobs'").fetchone():
             db.execute("UPDATE jobs SET status='failed',error='Archived by native DM upgrade' WHERE status IN ('queued','processing')")
         db.execute("INSERT OR IGNORE INTO native_meta VALUES ('worker','Paused')")
+
+
+def fail_processing(db, reason):
+    db.execute("UPDATE native_jobs SET state='failed', claim=NULL, reply=NULL, error=?, touched=? WHERE state='processing'",
+               (reason, time.time()))
+
+
+def save_runtime(db, runtime):
+    db.execute("INSERT OR REPLACE INTO native_meta VALUES ('launcher',?)", (json.dumps(runtime),))
+
+
+def check_browser(db, runtime, now):
+    if not runtime.get('autostart') or runtime['desired'] == 'close':
+        return
+    if runtime['browser'] in ('failed', 'left', 'closing', 'closed', 'blocked'):
+        reason = runtime['error'] or 'The managed SillyTavern tab disconnected.'
+    elif runtime.get('browser_seen') is not None and now - runtime['browser_seen'] > BROWSER_LEASE:
+        reason = 'Firefox stopped responding to the bridge.'
+    else:
+        return
+    runtime.update(desired='close', browser='failed', error=reason, failure=reason)
+    fail_processing(db, reason)
+    save_runtime(db, runtime)
 
 
 def dispatch(path, method, url, data):
@@ -45,8 +73,18 @@ def dispatch(path, method, url, data):
         db.execute('BEGIN IMMEDIATE')
         runtime_row = db.execute("SELECT value FROM native_meta WHERE key='launcher'").fetchone()
         runtime = json.loads(runtime_row[0]) if runtime_row else None
-        if runtime and time.time() - runtime['heartbeat'] > 15:
-            runtime['desired'] = 'close'
+        now = time.time()
+        if runtime:
+            if runtime['desired'] != 'close' and now - runtime['heartbeat'] > BROWSER_LEASE:
+                runtime['desired'] = 'close'
+                fail_processing(db, 'Quinn launcher stopped responding.')
+                save_runtime(db, runtime)
+            check_browser(db, runtime, now)
+            if runtime['autostart'] and runtime['desired'] != 'close':
+                db.execute('''UPDATE native_jobs
+                    SET state='failed', claim=NULL, reply=NULL, error=?, touched=?
+                    WHERE state='processing' AND coalesce(claimed_at,touched)<?''',
+                    (f'The Quinn job exceeded {JOB_DEADLINE} seconds.', now, now - JOB_DEADLINE))
         if endpoint == '/v1/launcher' and method == 'POST':
             operation = data.get('operation')
             if operation == 'create':
@@ -61,7 +99,10 @@ def dispatch(path, method, url, data):
                     if runtime['desired'] != 'close':
                         runtime['heartbeat'] = time.time()
                 elif operation in ('drain', 'close'):
-                    runtime['desired'] = operation
+                    if operation == 'close':
+                        fail_processing(db, 'Quinn stopped before the reply completed.')
+                    if runtime['desired'] != 'close':
+                        runtime['desired'] = operation
                 elif operation == 'disconnect':
                     runtime['disconnect'] = True
                 elif operation == 'report':
@@ -71,9 +112,12 @@ def dispatch(path, method, url, data):
                     runtime[role] = str(data.get('state', ''))[:100]
                     if 'error' in data:
                         runtime['error'] = str(data['error'])[:500]
+                    if role == 'browser':
+                        runtime['browser_seen'] = now
+                        check_browser(db, runtime, now)
                 else:
                     raise ValueError('Invalid lifecycle operation')
-            db.execute("INSERT OR REPLACE INTO native_meta VALUES ('launcher',?)", (json.dumps(runtime),))
+            save_runtime(db, runtime)
             return 200, runtime
         if endpoint == '/v1/launcher' and method == 'GET':
             if not runtime or parse_qs(parsed.query).get('session') != [runtime['session']]:
@@ -117,7 +161,7 @@ def dispatch(path, method, url, data):
             if not row:
                 return 200, {'job_id': None}
             claim = secrets.token_urlsafe(24)
-            db.execute("UPDATE native_jobs SET state='processing',claim=?,touched=? WHERE id=?", (claim,time.time(),row['id']))
+            db.execute("UPDATE native_jobs SET state='processing',claim=?,touched=?,claimed_at=? WHERE id=?", (claim,now,now,row['id']))
             person = db.execute('SELECT * FROM native_people WHERE user_id=?', (row['user_id'],)).fetchone()
             return 200, dict(json.loads(row['payload']), job_id=row['id'], claim_token=claim,
                              epoch=row['epoch'], route=json.loads(person['route']))

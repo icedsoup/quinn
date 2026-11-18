@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ctypes
+import argparse
 import hashlib
 import importlib.util
 import json
 import math
 import os
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -19,8 +21,11 @@ import urllib.request
 from collections import deque
 from pathlib import Path
 
+from telemetry import PREFIX, TelemetryStore
+
 ROOT = Path(__file__).resolve().parent
 IS_WIN = os.name == 'nt'
+ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)')
 
 
 class LaunchError(Exception):
@@ -54,11 +59,14 @@ class Component:
 
     @property
     def alive(self):
-        return self.proc is not None and self.proc.poll() is None
+        proc = self.proc
+        return proc is not None and proc.poll() is None
 
     def start(self, command, cwd=ROOT, env=None):
         if self.alive:
             return
+        if self.proc is not None or self.job is not None:
+            self.stop()
         self.state = 'starting'
         options = dict(cwd=str(cwd), env=env)
         if not self.window:
@@ -90,7 +98,9 @@ class Component:
         try:
             for line in iter(proc.stdout.readline, b''):
                 text = line.decode('utf-8', errors='replace').strip()
-                if text and not (self.name == 'bridge' and any(noise in text for noise in ('/v1/next', 'OPTIONS', '/v1/launcher', '/v1/status', 'CORS preflight'))):
+                if self.name == 'bridge' and re.search(r'"GET /v1/jobs/[^/ ?]+ HTTP/1\.\d" 200 -$', text):
+                    continue
+                if text and (text.startswith(PREFIX) or not (self.name == 'bridge' and any(noise in text for noise in ('/v1/next', 'OPTIONS', '/v1/launcher', '/v1/status', '/v1/telemetry', 'CORS preflight')))):
                     self.log(self.name, text)
         finally:
             proc.stdout.close()
@@ -117,10 +127,17 @@ class Component:
 
 
 class Launcher:
-    def __init__(self):
-        self.logs = deque(maxlen=16)
+    def __init__(self, gui=False):
+        self.gui = gui
+        executable = Path(sys.executable)
+        self.python = str(executable.with_name('python.exe')) if IS_WIN and executable.name.lower() == 'pythonw.exe' else sys.executable
+        self.telemetry = TelemetryStore()
+        self.logs = deque(maxlen=300)
         self.log_lock = threading.Lock()
-        self.components = {name: Component(name, self.log, name == 'sniper') for name in ('kobold', 'bridge', 'tavern', 'discord', 'sniper')}
+        self.monitor_lock = threading.Lock()
+        self.task_lock = threading.RLock()
+        self.stopping_pending = False
+        self.components = {name: Component(name, self.log, name == 'sniper' and not gui) for name in ('kobold', 'bridge', 'tavern', 'discord', 'sniper')}
         self.commands = queue.Queue()
         self.cancel = threading.Event()
         self.force = threading.Event()
@@ -138,10 +155,30 @@ class Launcher:
         self.cfg = {}
         self.last_heartbeat = 0
         self.console_handler = None
+        self.last_error = ''
 
     def log(self, name, text):
+        if self.telemetry.ingest(text):
+            if name in ('sniper', 'discord'):
+                try:
+                    event = json.loads(text[len(PREFIX):])
+                    if isinstance(event, dict) and event.get('source') == ('quinn' if name == 'discord' else name) and event.get('stage') == 'connection':
+                        if event.get('status') == 'complete':
+                            self.components[name].state = 'ready'
+                        elif event.get('status') in ('error', 'stopped'):
+                            self.components[name].state = 'reconnecting'
+                except (TypeError, ValueError):
+                    pass
+            return
+        text = ANSI.sub('', str(text))
+        text = ''.join(character for character in text if character.isprintable() or character == '\t')[:4000]
+        if name == 'error':
+            self.last_error = text
         with self.log_lock:
             self.logs.append(f'{time.strftime("%H:%M:%S")} [{name}] {text}')
+
+    def python_env(self, **values):
+        return dict(os.environ, QUINN_TELEMETRY='1', PYTHONIOENCODING='utf-8', **values)
 
     def configure(self, full):
         path = ROOT / 'quinn_config.json'
@@ -154,7 +191,7 @@ class Launcher:
             if not math.isfinite(timeout) or timeout <= 0:
                 raise LaunchError(f'{name}_timeout must be a finite positive number.')
         self.bridge_url = self.cfg.get('bridge_url', 'http://127.0.0.1:8765').rstrip('/')
-        self.tavern_url = self.settings.get('sillytavern_url', 'http://localhost:8000').rstrip('/')
+        self.tavern_url = self.settings.get('sillytavern_url', 'http://127.0.0.1:8000').rstrip('/')
         self.kobold_url = self.settings.get('kobold_url', 'http://127.0.0.1:5001').rstrip('/')
         self.tavern_dir = self.path(self.settings.get('sillytavern_directory', str(Path(self.cfg.get('sillytavern_start', 'SillyTavern/Start.bat')).parent)))
         for module in ('aiohttp', 'discord', 'colorama') + (('win32job',) if IS_WIN else ()):
@@ -199,21 +236,44 @@ class Launcher:
         path = Path(value)
         return path if path.is_absolute() else ROOT / path
 
+    def tavern_data_root(self):
+        config = self.tavern_dir / 'config.yaml'
+        if not config.is_file():
+            config = self.tavern_dir / 'default/config.yaml'
+        script = """
+const fs = require('node:fs');
+const yaml = require('yaml');
+const config = fs.existsSync(process.argv[1]) ? yaml.parse(fs.readFileSync(process.argv[1], 'utf8')) : {};
+const root = process.env.SILLYTAVERN_DATAROOT ?? config?.dataRoot ?? './data';
+if (typeof root !== 'string' || !root.trim()) process.exit(1);
+process.stdout.write(JSON.stringify(require('node:path').resolve(root)));
+"""
+        try:
+            result = subprocess.run([self.node, '-e', script, str(config)], cwd=self.tavern_dir,
+                                    capture_output=True, encoding='utf-8', timeout=10,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if IS_WIN else 0,
+                                    check=True)
+            return Path(json.loads(result.stdout))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise LaunchError(f'Could not resolve the SillyTavern data directory. Check dataRoot in {config}.') from exc
+
     def sync_extension(self):
         source = ROOT / 'put in tavern extensions/quinn-bridge'
-        target = self.tavern_dir / 'data/default-user/extensions/quinn-bridge'
+        target = self.tavern_data_dir / 'default-user/extensions/quinn-bridge'
         changed = [name for name in ('index.js', 'style.css', 'manifest.json') if not (target / name).exists() or (target / name).read_bytes() != (source / name).read_bytes()]
         if not changed:
             return
         if self.components['tavern'].alive:
             raise LaunchError('Stop SillyTavern before updating its Quinn extension.')
-        backup = ROOT / 'backups' / ('launcher-extension-' + time.strftime('%Y%m%d-%H%M%S'))
         if target.exists():
+            timestamp = time.strftime('%Y%m%d-%H%M%S')
+            backup = ROOT / 'backups' / f'launcher-extension-{timestamp}-{time.time_ns()}'
             shutil.copytree(target, backup)
+            self.log('launcher', 'Backed up the previous Quinn extension.')
         target.mkdir(parents=True, exist_ok=True)
         for name in changed:
             shutil.copy2(source / name, target / name)
-        self.log('launcher', 'Installed the Quinn extension update with a backup of the previous copy.')
+        self.log('launcher', 'Installed the Quinn extension.')
 
     def request(self, path, data=None):
         headers = {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'}
@@ -253,7 +313,8 @@ class Launcher:
             except (OSError, ValueError):
                 pass
             self.cancel.wait(0.25)
-        detail = ' Check the saved bridge token, character, extension, and Firefox tab.' if name == 'browser' else ''
+        detail = (f' Open {self.tavern_url} in Firefox and check that Quinn Native DMs is enabled '
+                  'and its bridge token and character are saved at that address.') if name == 'browser' else ''
         raise LaunchError(f'{name} readiness timed out.{detail}')
 
     def http(self, url, model=False):
@@ -276,17 +337,20 @@ class Launcher:
     def startup(self, full=True, sniper=False):
         self.stage = None
         before = {name for name, comp in self.components.items() if comp.alive}
+        if 'discord' not in before:
+            self.telemetry.reset('quinn')
         created_session = False
         try:
             self.configure(full)
             self.check_ports(full)
+            self.tavern_data_dir = self.tavern_data_root()
             self.sync_extension()
             self.check_cancel()
             if full:
                 self.components['kobold'].start([str(self.kobold_exe), '--config', str(self.kobold_config), '--skiplauncher'])
                 self.wait('kobold', 180, lambda: self.http(self.kobold_url + '/api/v1/model', True))
-            env = dict(os.environ, QUINN_BRIDGE_PORT=str(urllib.parse.urlparse(self.bridge_url).port or 80))
-            self.components['bridge'].start([sys.executable, '-u', str(ROOT / 'QuinnBridge/bridge/server.py')], env=env)
+            env = self.python_env(QUINN_BRIDGE_PORT=str(urllib.parse.urlparse(self.bridge_url).port or 80))
+            self.components['bridge'].start([self.python, '-u', str(ROOT / 'QuinnBridge/bridge/server.py')], env=env)
             self.wait('bridge', 10, lambda: self.http(self.bridge_url + '/health'))
             self.token = (ROOT / 'QuinnBridge/bridge/bridge_token.txt').read_text(encoding='utf-8').strip()
             if self.cfg.get('bridge_token') and self.cfg['bridge_token'] != self.token:
@@ -297,20 +361,27 @@ class Launcher:
             else:
                 self.session = self.control('create', autostart=full)['session']
                 created_session = True
-            self.components['tavern'].start([self.node, 'server.js', '--browserLaunchEnabled=false', '--port', str(urllib.parse.urlparse(self.tavern_url).port or 80)], cwd=self.tavern_dir, env=dict(os.environ, NODE_ENV='production'))
+            tavern_port = str(urllib.parse.urlparse(self.tavern_url).port or 80)
+            self.components['tavern'].start(
+                [self.node, 'server.js', '--browserLaunchEnabled=false', '--port', tavern_port,
+                 '--dataRoot', str(self.tavern_data_dir)],
+                cwd=self.tavern_dir, env=dict(os.environ, NODE_ENV='production'),
+            )
             self.wait('tavern', 60, lambda: self.http(self.tavern_url + '/'))
             if created_session:
                 subprocess.Popen([self.firefox, '-new-tab', self.tavern_url + '/#quinn-launch=' + self.session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if IS_WIN else 0)
             def browser_ready():
                 state = self.status()
+                if state.get('failure'):
+                    raise LaunchError(state['failure'])
                 if state['browser'] in ('failed', 'closed', 'blocked'):
                     raise LaunchError(state['error'] or 'SillyTavern extension failed.')
                 return state['browser'] in ('ready', 'busy')
             if full:
                 self.wait('browser', 30, browser_ready)
-                env = dict(os.environ, QUINN_LAUNCH_SESSION=self.session)
+                env = self.python_env(QUINN_LAUNCH_SESSION=self.session)
                 args = ['--dry-run' if self.dry else '--live']
-                self.components['discord'].start([sys.executable, '-u', str(ROOT / 'quinn_discord.py'), *args], env=env)
+                self.components['discord'].start([self.python, '-u', str(ROOT / 'quinn_discord.py'), *args], env=env)
                 self.wait('discord', 30, lambda: self.status()['discord'] in ('ready', 'busy'))
             if sniper:
                 self.start_sniper()
@@ -325,17 +396,27 @@ class Launcher:
                     self.components[name].stop()
             if self.stage in self.components and self.stage not in before and not self.cancel.is_set():
                 self.components[self.stage].state = 'failed'
+            if 'discord' not in before:
+                self.telemetry.mark_stopped('quinn', 'Startup canceled' if self.cancel.is_set() else 'Startup failed')
             self.log('launcher', 'Startup rolled back; check the log before retrying.')
         finally:
             self.operation = ''
 
     def start_sniper(self):
         try:
+            if self.components['sniper'].alive:
+                return
             if not (ROOT / 'config.json').is_file():
                 raise LaunchError('Copy config template.json to config.json and configure Sniper first.')
-            self.components['sniper'].start([sys.executable, '-u', str(ROOT / 'main.py')])
-            self.components['sniper'].state = 'ready'
+            self.check_cancel()
+            self.telemetry.reset('sniper')
+            env = self.python_env() if self.gui else dict(os.environ, PYTHONIOENCODING='utf-8', QUINN_TELEMETRY='0')
+            self.components['sniper'].start([self.python, '-u', str(ROOT / 'main.py')], env=env)
+            if not self.gui:
+                self.components['sniper'].state = 'running'
         except Exception as exc:
+            self.components['sniper'].state = 'failed'
+            self.telemetry.mark_stopped('sniper', 'Startup failed')
             self.log('error', str(exc))
 
     def close_tab(self, budget=3):
@@ -360,7 +441,7 @@ class Launcher:
         except Exception:
             self.log('launcher', 'Tab closure unconfirmed; the managed tab will attempt cleanup when its lease expires.')
 
-    def shutdown(self):
+    def shutdown(self, quinn_only=False):
         try:
             if self.session and self.components['bridge'].alive:
                 try:
@@ -368,7 +449,7 @@ class Launcher:
                     deadline = self.deadline('shutdown', 120)
                     while not self.force.is_set() and time.monotonic() < deadline:
                         state = self.status()
-                        if not state['active'] and state['browser'] != 'busy' and state['discord'] != 'busy':
+                        if state.get('desired') == 'close' or (not state['active'] and state['browser'] != 'busy' and state['discord'] != 'busy'):
                             break
                         self.force.wait(0.2)
                 except Exception as exc:
@@ -382,42 +463,104 @@ class Launcher:
                     pass
                 self.components['discord'].stop()
                 self.close_tab(0 if self.force.is_set() else 3)
-            for name in ('discord', 'tavern', 'kobold', 'bridge', 'sniper'):
+            names = ('discord', 'tavern', 'kobold', 'bridge')
+            for name in names if quinn_only else (*names, 'sniper'):
                 try:
                     self.components[name].stop()
                 except Exception as exc:
                     self.log('error', f'Could not stop {name}: {exc}')
             self.session = None
-            self.log('launcher', 'All managed components stopped.')
+            for source, component in (('quinn', 'discord'), ('sniper', 'sniper')):
+                if not self.components[component].alive:
+                    self.telemetry.mark_stopped(source)
+            self.log('launcher', 'Quinn services stopped.' if quinn_only else 'All managed components stopped.')
         finally:
             self.operation = ''
 
     def run_task(self, operation, target):
-        if self.worker and self.worker.is_alive():
-            self.log('launcher', 'An operation is already in progress.')
-            return
-        self.cancel.clear()
-        self.force.clear()
-        self.operation = operation
-        def work():
-            try:
-                target()
-            except Exception as exc:
-                self.log('error', str(exc))
-            finally:
-                self.operation = ''
-        self.worker = threading.Thread(target=work, daemon=True)
-        self.worker.start()
+        with self.task_lock:
+            if self.worker and self.worker.is_alive():
+                self.log('launcher', 'An operation is already in progress.')
+                return
+            self.cancel.clear()
+            self.force.clear()
+            self.operation = operation
+            if operation == 'starting':
+                self.last_error = ''
+            def work():
+                try:
+                    target()
+                except Exception as exc:
+                    self.log('error', str(exc))
+                finally:
+                    self.operation = ''
+            self.worker = threading.Thread(target=work, daemon=True)
+            self.worker.start()
 
     def stop_requested(self, quit=False):
-        self.quit |= quit
-        if self.operation == 'stopping':
-            self.force.set()
+        with self.task_lock:
+            self.quit |= quit
+            if self.operation == 'stopping':
+                self.force.set()
+                return
+            self.cancel.set()
+            if self.worker and self.worker.is_alive():
+                self.stopping_pending = True
+                return
+            self.stopping_pending = False
+            self.run_task('stopping', self.shutdown)
+
+    def handle(self, choice):
+        choice = choice.strip().lower()
+        with self.task_lock:
+            if choice in ('s', 'q'):
+                self.stop_requested(choice == 'q')
+            elif not self.quit and not self.stopping_pending:
+                if choice == 'd' and not self.operation:
+                    self.dry = not self.dry
+                elif choice in ('1', '2', '3', 't'):
+                    action = self.start_sniper if choice == '1' else lambda: self.startup(choice != 't', choice == '3')
+                    self.run_task('starting', action)
+
+    def monitor(self):
+        if not self.monitor_lock.acquire(blocking=False):
             return
-        self.cancel.set()
-        if self.worker and self.worker.is_alive():
-            return
-        self.run_task('stopping', self.shutdown)
+        try:
+            with self.task_lock:
+                if self.stopping_pending and not (self.worker and self.worker.is_alive()):
+                    self.stopping_pending = False
+                    self.run_task('stopping', self.shutdown)
+            if self.session and time.monotonic() - self.last_heartbeat >= 2:
+                try:
+                    state = self.control('heartbeat')
+                except Exception:
+                    state = {}
+                self.last_heartbeat = time.monotonic()
+                with self.task_lock:
+                    if state.get('failure') and not self.operation and not (self.worker and self.worker.is_alive()):
+                        self.log('error', state['failure'] + ' Stopping Quinn services.')
+                        self.telemetry.mark_stopped('quinn', state['failure'])
+                        self.run_task('stopping', lambda: self.shutdown(quinn_only=True))
+            for name, component in self.components.items():
+                proc = component.proc
+                if proc and proc.poll() is not None and component.proc is proc and component.state not in ('stopped', 'stopping', 'failed'):
+                    component.state = 'failed'
+                    self.log('error', f'{name} exited with code {proc.returncode}. Check the activity log.')
+                    self.telemetry.mark_stopped('sniper' if name == 'sniper' else 'quinn', f'{name} exited')
+        finally:
+            self.monitor_lock.release()
+
+    def install_handlers(self):
+        signal.signal(signal.SIGINT, lambda *_: self.handle('q'))
+        if IS_WIN:
+            callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+            def handler(event):
+                if event in (2, 5, 6):
+                    self.console_close()
+                    return True
+                return False
+            self.console_handler = callback(handler)
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(self.console_handler, True)
 
     def input_loop(self):
         while True:
@@ -442,19 +585,31 @@ class Launcher:
                 pass
 
     def draw(self):
-        os.system('cls' if IS_WIN else 'clear')
-        print('PROJECT QUINN | Mission Control\n')
+        width = max(42, min(shutil.get_terminal_size((100, 30)).columns - 4, 110))
+        if sys.stdout.isatty():
+            print('\x1b[2J\x1b[H', end='')
+        print('\n  Q U I N N   /   CONTROL ROOM')
+        print('  ' + '-' * width)
+        print(f'  {"Dry run" if self.dry else "Live replies"}  |  {self.operation.title() if self.operation else "Standing by"}\n')
         for name, comp in self.components.items():
             state = comp.state
             if comp.proc and not comp.alive and state not in ('stopped', 'stopping'):
                 state = 'failed'
-            print(f'  {name:<12} {state}')
-        print(f'\n  Mode: {"DRY-RUN" if self.dry else "LIVE"}   {self.operation}')
-        print('\n  [1] Sniper  [2] Quinn setup  [3] Everything  [t] SillyTavern')
-        print('  [s] Stop / force stop  [q] Stop and quit  [d] Toggle dry-run  [r] Refresh\n')
+            print(f'  {name.title():<15} {state.upper():<12}')
+        snapshots = self.telemetry.snapshot()
+        for source in ('quinn', 'sniper'):
+            events = snapshots[source]['events']
+            if events:
+                event = events[-1]
+                print(f'\n  {source.title()} / {event["stage"]} / {event["status"]}')
+                print('  ' + event['detail'][:width])
+        print('\n  ' + '-' * width)
+        print('  1  Sniper     2  Quinn     3  Start both     T  SillyTavern')
+        print('  S  Stop      Q  Quit      D  Dry run        R  Refresh')
+        print('  ' + '-' * width + '\n')
         with self.log_lock:
-            for line in self.logs:
-                print('  ' + line)
+            for line in list(self.logs)[-10:]:
+                print('  ' + line[:width])
         print('\n> ' + getattr(self, 'input_buffer', ''), end='', flush=True)
 
     def run(self):
@@ -462,18 +617,8 @@ class Launcher:
         self.input_buffer = ''
         if not keyboard:
             threading.Thread(target=self.input_loop, daemon=True).start()
-        signal.signal(signal.SIGINT, lambda *_: self.commands.put('q'))
-        if IS_WIN:
-            callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
-            def handler(event):
-                if event in (2, 5, 6):
-                    self.console_close()
-                    return True
-                return False
-            self.console_handler = callback(handler)
-            ctypes.windll.kernel32.SetConsoleCtrlHandler(self.console_handler, True)
+        self.install_handlers()
         redraw = 0
-        stopping_pending = False
         try:
             while True:
                 if keyboard:
@@ -492,16 +637,8 @@ class Launcher:
                         elif character.isprintable():
                             self.input_buffer += character
                         redraw = 0
-                if self.session and time.monotonic() - self.last_heartbeat >= 2:
-                    try:
-                        self.control('heartbeat')
-                    except Exception:
-                        pass
-                    self.last_heartbeat = time.monotonic()
-                if stopping_pending and not (self.worker and self.worker.is_alive()):
-                    stopping_pending = False
-                    self.run_task('stopping', self.shutdown)
-                if self.quit and not stopping_pending and not (self.worker and self.worker.is_alive()):
+                self.monitor()
+                if self.quit and not self.stopping_pending and not (self.worker and self.worker.is_alive()):
                     break
                 if time.monotonic() >= redraw:
                     self.draw()
@@ -510,28 +647,36 @@ class Launcher:
                     choice = self.commands.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                if choice in ('s', 'q'):
-                    stopping_pending = bool(self.worker and self.worker.is_alive() and self.operation != 'stopping')
-                    self.stop_requested(choice == 'q')
-                elif choice == 'd' and not self.operation:
-                    self.dry = not self.dry
-                elif choice in ('1', '2', '3', 't'):
-                    action = self.start_sniper if choice == '1' else lambda: self.startup(choice != 't', choice == '3')
-                    self.run_task('starting', action)
+                self.handle(choice)
                 redraw = 0
         finally:
             self.console_close()
 
 
-def main():
+def main(argv=None):
     if sys.version_info < (3, 10):
         print('Quinn requires Python 3.10 or newer.')
         return 1
+    parser = argparse.ArgumentParser(description='Quinn and Sniper control room')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--gui', action='store_true', help='Open the desktop control room')
+    mode.add_argument('--terminal', action='store_true', help='Use the terminal launcher')
+    args = parser.parse_args(argv)
+    gui = args.gui or (not args.terminal and (sys.stdin is None or sys.stdin.isatty()))
     try:
         with InstanceLock():
-            Launcher().run()
+            launcher = Launcher(gui=gui)
+            if gui:
+                from dashboard import run
+                launcher.install_handlers()
+                run(launcher)
+            else:
+                launcher.run()
     except (LaunchError, ImportError) as exc:
-        print(f'Quinn: {exc}')
+        if IS_WIN and sys.stderr is None:
+            ctypes.windll.user32.MessageBoxW(None, str(exc), 'Quinn', 0x10)
+        else:
+            print(f'Quinn: {exc}', file=sys.stderr)
         return 1
     return 0
 

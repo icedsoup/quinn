@@ -1,20 +1,56 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import socket
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from native_store import connection, dispatch, initialize
+from native_store import connection, dispatch, fail_processing, initialize
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parents[1]))
+from telemetry import emit
+
 DB_PATH = Path(os.environ.get("QUINN_BRIDGE_DB", str(ROOT / "quinn_bridge.sqlite3")))
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("QUINN_BRIDGE_PORT", "8765"))
 TOKEN_PATH = Path(os.environ.get("QUINN_BRIDGE_TOKEN_PATH", str(ROOT / "bridge_token.txt")))
+
+
+def publish_telemetry(data):
+    if data.get('stage') not in ('context', 'inference', 'reply'):
+        raise ValueError('Invalid telemetry stage')
+    if data.get('status') not in ('start', 'complete', 'error', 'skipped', 'info'):
+        raise ValueError('Invalid telemetry status')
+    if not isinstance(data.get('trace'), str) or not 1 <= len(data['trace']) <= 120:
+        raise ValueError('Invalid telemetry trace')
+    if not isinstance(data.get('detail', ''), str) or len(data.get('detail', '')) > 500:
+        raise ValueError('Invalid telemetry detail')
+    metrics = data.get('metrics', {})
+    allowed = {'duration_ms', 'elapsed_ms', 'context_messages', 'context_chars', 'output_chars',
+               'stream_updates', 'first_output_ms'}
+    if not isinstance(metrics, dict) or len(metrics) > len(allowed):
+        raise ValueError('Invalid telemetry metrics')
+    for key, value in metrics.items():
+        if key not in allowed or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1e12:
+            raise ValueError('Invalid telemetry measurement')
+    emit('quinn', data['stage'], data['status'], data.get('detail', ''), trace=data['trace'], **metrics)
+
+
+def observe_request(method, path, data, code, result):
+    if code >= 400:
+        return
+    endpoint = urlparse(path).path
+    if method == 'POST' and endpoint == '/v1/messages' and code == 202:
+        emit('quinn', 'intake', 'complete', 'DM accepted into the queue', trace=result['job_id'], input_chars=len(data['message']))
+    elif method == 'GET' and endpoint == '/v1/next' and result.get('job_id'):
+        emit('quinn', 'context', 'start', 'Opening the conversation and persona', trace=result['job_id'])
+
 
 def load_token():
     if TOKEN_PATH.exists():
@@ -172,7 +208,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         try:
-            code, result = dispatch(DB_PATH, method, self.path, self._read_json() if method == 'POST' else {})
+            data = self._read_json() if method == 'POST' else {}
+            if method == 'POST' and self.path == '/v1/telemetry':
+                publish_telemetry(data)
+                return self.send_json(200, {'ok': True})
+            code, result = dispatch(DB_PATH, method, self.path, data)
+            observe_request(method, self.path, data, code, result)
             self.send_json(code, result)
         except ValueError as error:
             self.send_json(400, {'error': str(error)})
@@ -186,6 +227,7 @@ def main():
         server.token = load_token()
         initialize(DB_PATH)
         with connection(DB_PATH) as db:
+            fail_processing(db, 'Quinn stopped before the reply completed.')
             db.execute("DELETE FROM native_meta WHERE key='launcher'")
         log(f"Quinn bridge listening at http://{HOST}:{PORT}")
         log(f"Bridge token file: {TOKEN_PATH}")

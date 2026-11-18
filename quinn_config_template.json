@@ -14,7 +14,7 @@
     "kobold_config": "config.kcpps",
     "kobold_url": "http://127.0.0.1:5001",
     "sillytavern_directory": "SillyTavern",
-    "sillytavern_url": "http://localhost:8000",
+    "sillytavern_url": "http://127.0.0.1:8000",
     "node": "node",
     "kobold_timeout": 180,
     "bridge_timeout": 10,

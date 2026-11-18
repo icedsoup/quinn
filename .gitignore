@@ -1,14 +1,16 @@
 /config.json
 /quinn_config.json
-/config.kcpps
+*.kcpps
 /koboldcpp.exe
 /sillytavern.bat.lnk
 /SillyTavern/
 /models/
 /backups/
 /log.txt
+/QuinnBridge/behavior/
 /QuinnBridge/bridge/bridge_token.txt
 /QuinnBridge/bridge/native_migration.json
+*.bundle
 *.gguf
 *.sqlite
 *.sqlite-*

@@ -4,7 +4,7 @@ SillyTavern owns chat history. The bridge stores routing, jobs, and delivery sta
 
 ## Recovery
 
-Pause the worker before editing chats. A processing claim expires after 90 seconds without a heartbeat. Saved job markers prevent a retry from appending the same message or generating a second completed reply. If a partial reply blocks recovery, pause the worker, remove the partial reply, and restart after the claim expires. If delivery is marked uncertain, check Discord before intervening. The bridge never automatically resends an uncertain delivery.
+Pause the worker before editing chats. Managed jobs have a 90-second deadline, including chat loading and reply verification. An expired job fails and the managed session stays open while its browser is healthy. Outside a managed session, a processing claim can be recovered after 90 seconds without a heartbeat. Saved job markers prevent a retry from appending the same message or generating a second completed reply. Pause the worker before removing any partial reply from the affected chat. If delivery is marked uncertain, check Discord before intervening. The bridge never automatically resends an uncertain delivery.
 
 ## Legacy migration
 

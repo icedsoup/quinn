@@ -12,10 +12,12 @@ import math
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import aiohttp
 import discord
+from telemetry import emit
 
 
 ROOT = Path(__file__).parent
@@ -225,12 +227,16 @@ class QuinnClient(discord.Client):
         log.info("Connected as %s (%s) [%s]", self.user, self.user.id, mode)
         print(f"[Quinn] {self.user}  [{mode}]")
         ok = await self.bridge.ping()
+        emit('quinn', 'connection', 'complete', 'Discord connected', dry_run=self.dry_run, bridge_reachable=ok)
         if ok and not self._resumed and not self.dry_run:
             self._resumed = True
             asyncio.create_task(self._resume())
         print(f"[Quinn] Bridge: {'OK ✓' if ok else 'NOT REACHABLE — start bridge server first'}")
         if os.environ.get('QUINN_LAUNCH_SESSION') and not getattr(self, '_lifecycle_task', None):
             self._lifecycle_task = asyncio.create_task(self._lifecycle())
+
+    async def on_disconnect(self):
+        emit('quinn', 'connection', 'error', 'Discord connection interrupted')
 
     async def _lifecycle(self):
         session = os.environ['QUINN_LAUNCH_SESSION']
@@ -279,6 +285,7 @@ class QuinnClient(discord.Client):
         log.info("← [%s] %s: %r", uid, name, text[:100])
 
         if self.dry_run:
+            emit('quinn', 'intake', 'skipped', 'Dry run: DM observed without generating a reply', trace=str(m.id), input_chars=len(text))
             print(f"[Quinn/dry] {name} ({uid}): {text[:60]!r}")
             return
 
@@ -287,6 +294,7 @@ class QuinnClient(discord.Client):
             discord_message_id=str(m.id), dm_channel_id=str(m.channel.id),
         )
         if not job_id:
+            emit('quinn', 'intake', 'error', 'The bridge did not accept the DM', trace=str(m.id), input_chars=len(text))
             log.warning("Enqueue failed for %s — bridge down?", name)
             return
 
@@ -308,30 +316,41 @@ class QuinnClient(discord.Client):
             self._delivering -= 1
 
     async def _send_reply(self, job_id, channel, reply):
+        started = time.perf_counter()
+        emit('quinn', 'delivery', 'start', 'Preparing Discord delivery', trace=job_id, output_chars=len(reply))
         if self.cfg.get("typing_simulation", True):
+            typing_started = time.perf_counter()
+            emit('quinn', 'delivery', 'info', 'Typing delay configured before sending', trace=job_id)
             try:
                 async with channel.typing():
                     await _human_delay(reply, self.cfg)
             except discord.HTTPException:
                 pass
+            emit('quinn', 'delivery', 'info', 'Typing delay finished', trace=job_id, typing_delay_ms=(time.perf_counter() - typing_started) * 1000)
         delivery = await self.bridge.action(job_id, "delivery", {})
         if not delivery:
+            emit('quinn', 'delivery', 'skipped', 'Delivery claim unavailable; no message sent', trace=job_id, duration_ms=(time.perf_counter() - started) * 1000)
             return
+        send_started = time.perf_counter()
         try:
             sent = await channel.send(delivery["reply"])
         except Exception:
+            emit('quinn', 'delivery', 'error', 'Delivery uncertain; automatic retry suppressed', trace=job_id, duration_ms=(time.perf_counter() - started) * 1000, uncertain=True)
             log.exception("Delivery uncertain for job %s; automatic retry suppressed", job_id)
             return
+        send_ms = (time.perf_counter() - send_started) * 1000
         for attempt in range(3):
             try:
                 if await self.bridge.action(job_id, "ack", {
                     "delivery_token": delivery["delivery_token"],
                     "discord_message_id": str(sent.id),
                 }):
+                    emit('quinn', 'delivery', 'complete', 'Discord message sent and acknowledged', trace=job_id, duration_ms=(time.perf_counter() - started) * 1000, send_ms=send_ms, output_chars=len(delivery['reply']))
                     return
             except Exception:
                 log.warning("Delivery acknowledgement failed for job %s", job_id)
             await asyncio.sleep(1)
+        emit('quinn', 'delivery', 'error', 'Message sent; bridge acknowledgement uncertain', trace=job_id, duration_ms=(time.perf_counter() - started) * 1000, send_ms=send_ms, uncertain=True)
         log.error("Message sent but acknowledgement uncertain for job %s", job_id)
 
     async def _resume(self):
